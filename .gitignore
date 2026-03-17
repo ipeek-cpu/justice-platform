@@ -9,3 +9,6 @@ dist/
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+resume-outputs/
+memory/state.json
+memory/*.md

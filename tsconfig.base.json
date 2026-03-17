@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "baseUrl": ".",
+    "paths": {
+      "@justice/knowledge-base": ["./packages/knowledge-base/src"],
+      "@justice/scoring-engine": ["./packages/scoring-engine/src"],
+      "@justice/case-packages": ["./packages/case-packages/src"],
+      "@justice/messaging": ["./packages/messaging/src"],
+      "@justice/shared-types": ["./packages/shared-types/src"]
+    }
+  },
+  "exclude": ["node_modules", "dist"]
+}

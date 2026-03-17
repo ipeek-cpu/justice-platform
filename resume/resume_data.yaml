@@ -1,0 +1,133 @@
+personal_info:
+  name: ISAIAH M. PEEK
+  location: Chicago, IL 60661
+  email: ipeekwork@gmail.com
+  phone: 678-480-0791
+  linkedin: https://www.linkedin.com/in/ipeek/
+
+skills:
+  languages:
+    - SQL
+    - Python
+    - Java
+    - JavaScript
+    - TypeScript
+    - R (working knowledge)
+    - C#
+  frameworks:
+    - Pandas
+    - NumPy
+    - scikit-learn
+    - statsmodels
+    - FastAPI
+    - Flask
+    - React.js
+    - Node.js
+    - Apache Spark
+    - Apache Hive
+  platforms:
+    - Azure (Azure SQL)
+    - SQL Server
+    - Oracle
+    - PostgreSQL
+    - Hadoop
+    - Cloudera
+    - Linux
+  tools:
+    - Power BI
+    - Tableau
+    - Jupyter Notebook
+    - Git
+    - Bitbucket
+    - Elasticsearch
+    - Kibana
+    - Jenkins
+    - SSMS
+    - SharePoint
+  soft_skills:
+    - Data integration & ETL
+    - Data quality & reconciliation
+    - Performance analysis & optimization
+    - Cross-functional stakeholder collaboration
+    - Business-to-technical translation
+    - Ownership across ambiguous initiatives
+
+experience:
+  - title: Application Specialist (Data Products & Analytics)
+    company: Ariel Investments
+    location: Chicago, IL
+    dates: Oct 2024 - Present
+    responsibilities:
+      - Built and maintained governed analytical datasets and semantic models (Azure SQL, SQL Server, Power BI) supporting firmwide KPIs for investment, operations, and compliance teams.
+      - Standardized KPI definitions and reconciliation logic to improve consistency across dashboards, ad-hoc analyses, and executive reporting.
+      - Developed Python-based automation and data tooling to improve reliability, reduce manual effort, and support recurring reporting workflows.
+      - Partnered with cross-functional stakeholders to translate business questions into measurable metrics and reusable data products.
+
+  - title: Senior Application Architect
+    company: Bank of America
+    location: Chicago, IL
+    dates: Oct 2022 - Jul 2024
+    responsibilities:
+      - Served as a technical advisor within Global Risk Analytics, guiding stakeholders through data-driven initiatives and architectural decisions.
+      - Contributed Python code to the bank’s internal regression modeling platform supporting quantitative risk teams.
+      - Automated usage reporting and analytics for the bank’s internal Python statistical library, generating dashboards used to demonstrate adoption and secure continued funding.
+      - Improved data integration and reporting workflows by enhancing ETL processes sourcing data from enterprise platforms including Apache Hive, Teradata, and Cloudera-managed Hadoop environments.
+      - Led a team in designing and implementing application solutions leveraging Hadoop-based data platforms.
+      - Built business intelligence dashboards using React, Next.js, Chart.js, and Oracle DB to support model evaluation, historical analysis, and executive reporting.
+      - Standardized model specification inputs and data extraction logic across modeling teams to improve data quality and consistency.
+      - Wrote unit and integration tests for web applications and data tooling to improve reliability and maintainability.
+      - Applied SQL and Python to investigate data inconsistencies, implement validation checks, and optimize query performance for large analytical datasets.
+      - Supported source control workflows using Git and Bitbucket in a regulated enterprise environment.
+
+  - title: Software Developer
+    company: National Housing Compliance
+    location: Atlanta, GA
+    dates: Nov 2019 - Oct 2022
+    responsibilities:
+      - Developed analytics-driven reporting and compliance workflows using SQL Server, Python, and .NET technologies.
+      - Built ETL routines, reconciliation logic, and exception reporting to ensure regulatory data accuracy.
+      - Designed and maintained standardized datasets and dashboards used by business and compliance stakeholders.
+      - Collaborated with non-technical users to translate regulatory requirements into structured data models and reports.
+
+  - title: Application Analyst
+    company: Dayforce
+    location: Atlanta, GA
+    dates: Jun 2018 - May 2019
+    responsibilities:
+      - Performed SQL-based investigations and data validation in a high-volume SaaS environment.
+      - Resolved payroll-related data issues under SLA constraints through root-cause analysis and remediation.
+      - Created repeatable query patterns and validation scripts to support operational reporting and issue resolution.
+      - Partnered with QA and client teams to improve data accuracy and incident turnaround times.
+
+education:
+  - institution: Georgia State University
+    location: Atlanta, GA
+    degree: B.B.A. in Computer Information Systems (Data Analytics & Cyber Security)
+    dates: Jun 2014 - May 2018
+
+certificates:
+  - title: Data Science & Analytics Bootcamp
+    institution: Georgia Institute of Technology
+    location: Atlanta, GA
+    dates: Dec 2020 - Jun 2021
+    description: []
+  - title: Advanced SQL & Tableau
+    institution: Emory University
+    location: Atlanta, GA
+    dates: Nov 2019 - Dec 2019
+    description: []
+
+expertise:
+  - category: Data Integration & Reporting
+    description: Designs and improves ETL workflows, reporting pipelines, and data validation processes across enterprise platforms.
+  - category: Analytics Engineering
+    description: Builds analytics-ready datasets, semantic models, and dashboards that support decision-making and regulatory needs.
+  - category: Enterprise Data Platforms
+    description: Works across relational, Hadoop-based, and cloud data environments to support large-scale analytical workloads.
+  - category: Stakeholder Enablement
+    description: Partners with business and technical teams to translate requirements into reliable, production-ready data solutions.
+
+role_targeting:
+  title: Senior Data Engineer
+  company: Bank of America
+  priority_focus: big data platforms, analytics engineering, enterprise data integration

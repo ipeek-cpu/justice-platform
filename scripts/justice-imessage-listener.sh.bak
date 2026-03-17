@@ -1,0 +1,73 @@
+#!/bin/bash
+# Justice iMessage Listener
+# Polls Messages.db for new inbound messages from approved numbers
+# Routes to executive webhook at localhost:3002/webhook/executive
+
+DB="$HOME/Library/Messages/chat.db"
+LAST_ROWID_FILE="/tmp/justice_last_rowid"
+WEBHOOK_URL="http://localhost:3002/webhook/executive"
+
+# Load approved numbers from env
+APPROVED_1=$(doppler secrets get APPROVED_NUMBER_ISAIAH --plain 2>/dev/null)
+APPROVED_2=$(doppler secrets get APPROVED_NUMBER_SCOTT --plain 2>/dev/null)
+
+# Get last processed rowid
+LAST_ROWID=$(cat "$LAST_ROWID_FILE" 2>/dev/null || echo "0")
+
+# Query for new inbound messages
+while IFS='|' read -r rowid sender text; do
+  [ -z "$text" ] && continue
+
+  # Normalize sender
+  SENDER_CLEAN=$(echo "$sender" | tr -d ' -()' | sed 's/^1/+1/')
+
+  # Check if sender is approved
+  if [[ "$SENDER_CLEAN" == "$APPROVED_1" ]] || [[ "$SENDER_CLEAN" == "$APPROVED_2" ]]; then
+    curl -s -X POST "$WEBHOOK_URL" \
+      -H "Content-Type: application/json" \
+      -d "{\"From\": \"$SENDER_CLEAN\", \"Body\": $(echo "$text" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'), \"Channel\": \"imessage\"}" \
+      > /tmp/justice_last_response.json 2>&1
+
+    # Send reply back via AppleScript
+    # Sanitize: replace backslashes, double quotes, and newlines for AppleScript safety
+    REPLY=$(cat /tmp/justice_last_response.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    reply = data.get('reply', '')
+    reply = reply.replace('\\\\', '\\\\\\\\')
+    reply = reply.replace('\"', \"'\")
+    reply = reply.replace('\n', '\\\\n')
+    reply = reply.replace('\r', '')
+    print(reply)
+except:
+    print('')
+" 2>/dev/null)
+
+    if [ -n "$REPLY" ]; then
+      if ! osascript <<APPLESCRIPT
+tell application "Messages"
+  set targetService to 1st service whose service type = iMessage
+  set targetBuddy to buddy "$sender" of targetService
+  send "$REPLY" to targetBuddy
+end tell
+APPLESCRIPT
+      then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] osascript failed for sender=$sender reply=$REPLY" >> /tmp/justice-imessage-error.log
+      fi
+    fi
+  fi
+
+  echo "$rowid" > "$LAST_ROWID_FILE"
+
+done < <(sqlite3 "$DB" "
+SELECT m.rowid, h.id, m.text
+FROM message m
+JOIN handle h ON m.handle_id = h.rowid
+WHERE m.rowid > $LAST_ROWID
+  AND m.is_from_me = 0
+  AND m.text IS NOT NULL
+  AND m.text != ''
+ORDER BY m.rowid ASC
+LIMIT 20
+" 2>/dev/null)

@@ -1,0 +1,32 @@
+{
+  "name": "@justice/justice-agent",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@justice/case-packages": "workspace:*",
+    "@justice/knowledge-base": "workspace:*",
+    "@justice/messaging": "workspace:*",
+    "@justice/scoring-engine": "workspace:*",
+    "@justice/shared-types": "workspace:*",
+    "@notionhq/client": "^5.12.0",
+    "drizzle-orm": "^0.45.1",
+    "googleapis": "^171.4.0",
+    "ioredis": "^5.10.0",
+    "node-cron": "^4.2.1",
+    "postgres": "^3.4.8"
+  },
+  "devDependencies": {
+    "@types/ioredis": "^5.0.0",
+    "@types/node": "^20.11.0",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}

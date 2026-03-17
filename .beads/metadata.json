@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "justice_repo",
+  "project_id": "96b191be-8d59-44e7-8af0-f8c34be0e6c2"
+}

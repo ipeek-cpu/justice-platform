@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.local
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db

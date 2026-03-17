@@ -26,6 +26,7 @@ import { getElevenLabsAgentId, buildVoiceTwiml } from '../integrations/elevenlab
 import { getTenantByPhone } from '../multi-tenancy/tenant-registry';
 import { getAuthUrl, handleOAuthCallback } from '../integrations/google-workspace';
 import { getCallerIdentity } from '../access-control/approved-numbers';
+import { parseApprovalReply, formatStamp } from '../integrations/approval-gate';
 
 const PORT = parseInt(process.env.EXECUTIVE_WEBHOOK_PORT ?? '3002', 10);
 
@@ -301,6 +302,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       if (isJson) {
         sendJson(res, 403, { error: 'unauthorized', reply: '' });
       } else {
+        sendTwiml(res);
+      }
+      return;
+    }
+
+    // Check if this is an approval reply (yes/no with optional stamp)
+    const approvalResult = await parseApprovalReply(message.body);
+    if (approvalResult.handled) {
+      const ack = `${approvalResult.decision === 'YES' ? 'Approved' : 'Denied'} ${formatStamp(approvalResult.approvalId)}.`;
+      console.log(`[executive-webhook] Approval reply: ${ack}`);
+      if (isJson) {
+        sendJson(res, 200, { reply: ack });
+      } else {
+        if (ack) await sendTwilioReply(message.from, ack);
         sendTwiml(res);
       }
       return;

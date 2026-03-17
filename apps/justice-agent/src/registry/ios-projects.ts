@@ -6,27 +6,38 @@ export interface iOSProject {
   githubUrl: string;
   localPath: string;
   defaultBranch: string;
-  stack: 'SwiftUI' | 'UIKit' | 'mixed';
+  stack: 'SwiftUI' | 'UIKit' | 'TypeScript' | 'mixed';
   deploymentTarget: string;
-  notionPageUrl?: string;
+  notionHubUrl?: string;
+  xcodeSchemeName: string;
   description: string;
 }
 
-// Isaiah's iOS projects — update as repos are added
-// Justice reads this registry before starting any iOS task
 export const IOS_PROJECTS: iOSProject[] = [
-  // Add projects here as they're onboarded
-  // Example:
-  // {
-  //   id: 'intake-app',
-  //   name: 'Wolf Law Intake App',
-  //   githubUrl: 'https://github.com/ipeek-cpu/intake-app',
-  //   localPath: path.join(process.env.HOME!, 'Developer/ios/intake-app'),
-  //   defaultBranch: 'main',
-  //   stack: 'SwiftUI',
-  //   deploymentTarget: '16.0',
-  //   description: 'Plaintiff intake app for Wolf Law callers',
-  // },
+  {
+    id: 'hlstc',
+    name: 'HLSTC',
+    githubUrl: 'https://github.com/theaionlab/hlstc-app',
+    localPath: path.join(process.env.HOME!, 'Developer/ios/hlstc-app'),
+    defaultBranch: 'main',
+    stack: 'SwiftUI',
+    deploymentTarget: 'latest',
+    notionHubUrl: 'https://www.notion.so/326967f4607e8185b726c61b3856ae14',
+    xcodeSchemeName: 'HLSTC',
+    description: 'AI-powered fitness and nutrition app — personal trainer in your pocket',
+  },
+  {
+    id: 'flaggd',
+    name: 'Flaggd',
+    githubUrl: 'https://github.com/theaionlab/flaggd',
+    localPath: path.join(process.env.HOME!, 'Developer/ios/flaggd'),
+    defaultBranch: 'main',
+    stack: 'TypeScript',
+    deploymentTarget: 'latest',
+    notionHubUrl: '',
+    xcodeSchemeName: 'flaggd',
+    description: 'Privacy-first iOS app analyzing dating/relationship message threads',
+  },
 ];
 
 export function getProject(id: string): iOSProject | undefined {

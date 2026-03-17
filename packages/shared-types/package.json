@@ -9,5 +9,8 @@
   },
   "devDependencies": {
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "ioredis": "^5.10.0"
   }
 }

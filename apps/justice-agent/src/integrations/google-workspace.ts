@@ -254,8 +254,9 @@ export async function sendGmail(
     const gmail = google.gmail({ version: 'v1', auth });
 
     const toHeader = to.join(', ');
+    const encodedSubject = `=?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`;
     const raw = Buffer.from(
-      `To: ${toHeader}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
+      `To: ${toHeader}\r\nSubject: ${encodedSubject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
     ).toString('base64url');
 
     const response = await gmail.users.messages.send({
@@ -272,6 +273,69 @@ export async function sendGmail(
     return { messageId: response.data.id ?? '', sentFrom };
   } catch (error) {
     return { error: error instanceof Error ? error.message : 'Gmail send failed' };
+  }
+}
+
+/**
+ * Send email with file attachment via Gmail API.
+ */
+export async function sendGmailWithAttachment(
+  callerIdentity: string,
+  to: string[],
+  subject: string,
+  body: string,
+  attachment: { filename: string; path: string; mimeType: string },
+  fromAccount?: string
+): Promise<{ messageId: string; sentFrom: string } | { error: string }> {
+  try {
+    const fs = require('fs');
+    const auth = await getAuthedClient(callerIdentity, fromAccount);
+    const gmail = google.gmail({ version: 'v1', auth });
+
+    const toHeader = to.join(', ');
+    const boundary = `boundary_${Date.now()}`;
+    const fileContent = fs.readFileSync(attachment.path);
+    const encodedFile = fileContent.toString('base64');
+
+    // RFC 2047 encode subject for non-ASCII safety
+    const encodedSubject = `=?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`;
+
+    const rawParts = [
+      `From: Justice <justice@wolflaw.ai>`,
+      `To: ${toHeader}`,
+      `Subject: ${encodedSubject}`,
+      `MIME-Version: 1.0`,
+      `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain; charset=utf-8',
+      'Content-Transfer-Encoding: quoted-printable',
+      '',
+      body,
+      `--${boundary}`,
+      `Content-Type: ${attachment.mimeType}`,
+      `Content-Disposition: attachment; filename="${attachment.filename}"`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      encodedFile,
+      `--${boundary}--`,
+    ].join('\r\n');
+
+    const raw = Buffer.from(rawParts).toString('base64url');
+
+    const response = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: { raw },
+    });
+
+    const token = fromAccount
+      ? await getOAuthTokenByEmail(callerIdentity, fromAccount)
+      : await getPrimaryOAuthToken(callerIdentity);
+    const sentFrom = token?.accountEmail ?? 'unknown';
+
+    return { messageId: response.data.id ?? '', sentFrom };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Gmail send with attachment failed' };
   }
 }
 

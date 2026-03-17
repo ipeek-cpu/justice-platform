@@ -10,13 +10,26 @@
 
 import { getCaseMetrics, getCaseBySessionId, createTask, getTasksByAssignee, completeTask, logAuditEntry } from '../db/queries';
 import { searchNotion, readNotionPage, createNotionPage, appendToNotionPage, queryNotionDatabase } from '../integrations/notion-client';
-import { getCalendarEvents, createCalendarEvent, sendGmail, hasGoogleAuth, getConnectedAccounts } from '../integrations/google-workspace';
+import { getCalendarEvents, createCalendarEvent, sendGmail, sendGmailWithAttachment, hasGoogleAuth, getConnectedAccounts } from '../integrations/google-workspace';
 import { configureNudge, getNudgeState } from '../nudge/task-nudger';
 import { runMorningBrief, getMorningBriefState, setMorningBriefEnabled } from '../nudge/morning-brief';
 import { appendToMemory } from '../memory/session-logger';
 import { draftOutreachBatch } from './linkedin-outreach';
+import { generateTailoredResume, generateBatch } from './resume-engine';
+import { notionLogger } from '../integrations/notion-logger';
+import { sendIMessage } from '@justice/messaging';
 import { getProject, listProjects } from '../registry/ios-projects';
-import { execSync } from 'child_process';
+import { listActiveCheckouts, atomicClaim } from '@justice/shared-types';
+import { exec, execSync } from 'child_process';
+import { promisify } from 'util';
+import { runReviewAgent } from './review-agent';
+import { runOvernightSession, runBuildCheck } from './overnight-runner';
+import { buildPRDescription } from '../integrations/github';
+import { createApproval, formatStamp, listPendingApprovals } from '../integrations/approval-gate';
+
+const execAsync = promisify(exec);
+
+const ISAIAH = process.env.APPROVED_NUMBER_ISAIAH!;
 
 export interface ConversationMessage {
   role: 'user' | 'assistant';
@@ -298,6 +311,140 @@ const TOOL_DEFINITIONS = [
       required: ['action'],
     },
   },
+  {
+    name: 'resume_generate',
+    description: 'Generate a tailored resume YAML for a specific job. Reorders and filters master resume data to match the job description. Never invents content.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        company_name: { type: 'string', description: 'Target company name' },
+        role_title: { type: 'string', description: 'Target role/job title' },
+        job_description: { type: 'string', description: 'Full job description text' },
+      },
+      required: ['company_name', 'role_title', 'job_description'],
+    },
+  },
+  {
+    name: 'resume_batch',
+    description: 'Generate tailored resumes for multiple roles in batch. Each gets its own YAML variant.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        roles: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              company_name: { type: 'string' },
+              role_title: { type: 'string' },
+              job_description: { type: 'string' },
+            },
+            required: ['company_name', 'role_title', 'job_description'],
+          },
+          description: 'List of target roles to generate resumes for',
+        },
+      },
+      required: ['roles'],
+    },
+  },
+  {
+    name: 'email_resume',
+    description: 'Generate a tailored resume and email the PDF to a specified address. Combines resume generation with email delivery.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        company_name: { type: 'string', description: 'Target company name' },
+        role_title: { type: 'string', description: 'Target role/job title' },
+        job_description: { type: 'string', description: 'Full job description text' },
+        email_to: { type: 'string', description: 'Email address to send the resume to (defaults to Isaiah)' },
+      },
+      required: ['company_name', 'role_title', 'job_description'],
+    },
+  },
+  {
+    name: 'checkout_status',
+    description: 'List all currently checked-out autonomous code execution tasks.',
+    input_schema: { type: 'object' as const, properties: {}, required: [] as string[] },
+  },
+  {
+    name: 'ios_build',
+    description: 'Build an iOS project using xcodebuild. Reports success/failure.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string', description: 'Project ID: hlstc or flaggd' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'ios_clean',
+    description: 'Clear DerivedData and clean the Xcode build for a project.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'ios_status',
+    description: 'Get current status of an iOS project: open beads + last 5 commits.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'ios_pr',
+    description: 'Push current branch and create a draft PR for an iOS project. Requires Isaiah approval.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string' },
+        title: { type: 'string', description: 'PR title' }
+      },
+      required: ['project_id', 'title']
+    }
+  },
+  {
+    name: 'ios_review',
+    description: 'Spawn review agent on current branch diff for an iOS project.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'ios_run_overnight',
+    description: 'Start an autonomous overnight run for an iOS project. Works through all unblocked beads, commits, builds, reviews, creates PR draft.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'ios_start_bead',
+    description: 'Claim a specific bead and start autonomous execution on it.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string' },
+        bead_id: { type: 'string', description: 'Bead ID e.g. MIGR-AUTH-001' }
+      },
+      required: ['project_id', 'bead_id']
+    }
+  },
 ];
 
 async function buildSystemPrompt(callerIdentity: string, currentDate: string): Promise<string> {
@@ -333,7 +480,16 @@ Rules:
 Nudges: I proactively remind you about upcoming and overdue tasks via iMessage. You can pause, snooze, or check nudge status.
 - Morning brief: I send you a daily briefing at 8 AM with tasks, deadlines, and case updates. You can ask me to send one now, or disable/enable them.
 
-Available actions: query case metrics, look up cases, create/list/complete tasks, draft and send emails, schedule meetings, check calendar, provide status briefings, search/read/create/update Notion pages, configure task nudges, manage morning briefs, draft LinkedIn outreach (logged to Notion, never sent directly), log facts to long-term memory, check beads task status, queue autonomous code execution tasks, and manage iOS project registry.`;
+Available actions: query case metrics, look up cases, create/list/complete tasks, draft and send emails, schedule meetings, check calendar, provide status briefings, search/read/create/update Notion pages, configure task nudges, manage morning briefs, draft LinkedIn outreach (logged to Notion, never sent directly), log facts to long-term memory, check beads task status, queue autonomous code execution tasks, manage iOS project registry, generate tailored resumes (single, batch, or generate-and-email — rephrases and reorders resume content to match job descriptions, never fabricates), email resume PDFs as attachments, check task checkout status (see which autonomous tasks are currently claimed), and manage iOS projects (build, clean, status, PR, review, overnight runs, start specific beads).
+
+iOS project commands — project IDs: hlstc, flaggd
+- "[project] build" or "build [project]" — build with xcodebuild
+- "[project] clean" — clear DerivedData and clean build
+- "[project] status" — open beads + recent commits
+- "[project] pr [title]" — create PR draft (requires approval to push)
+- "[project] review" — spawn review agent on current branch diff
+- "[project] run tonight" or "run [project] overnight" — autonomous overnight run
+- "[project] start [bead-id]" — claim and start a specific bead`;
 }
 
 async function executeTool(
@@ -627,6 +783,161 @@ async function executeTool(
         return JSON.stringify(project);
       }
       return JSON.stringify({ error: `Unknown ios_task action: ${action}` });
+    }
+
+    case 'resume_generate': {
+      const result = await generateTailoredResume({
+        companyName: input.company_name as string,
+        roleTitle: input.role_title as string,
+        jobDescription: input.job_description as string,
+      });
+      return JSON.stringify({
+        success: true,
+        yaml_path: result.variantYamlPath,
+        diff_summary: result.diffSummary,
+      });
+    }
+
+    case 'email_resume': {
+      const result = await generateTailoredResume({
+        companyName: input.company_name as string,
+        roleTitle: input.role_title as string,
+        jobDescription: input.job_description as string,
+      });
+      const emailTo = (input.email_to as string) || 'isaiahmpeek@gmail.com';
+      const fs = require('fs');
+      if (fs.existsSync(result.pdfPath)) {
+        const emailResult = await sendGmailWithAttachment(
+          callerIdentity,
+          [emailTo],
+          `Tailored Resume - ${input.role_title} at ${input.company_name}`,
+          `Here's your tailored resume for ${input.role_title} at ${input.company_name}.\n\nWhat changed:\n${result.diffSummary}`,
+          { filename: `resume_${(input.company_name as string).toLowerCase().replace(/\s+/g, '_')}.pdf`, path: result.pdfPath, mimeType: 'application/pdf' },
+        );
+        if ('error' in emailResult) {
+          return JSON.stringify({ success: false, error: emailResult.error, yaml_path: result.variantYamlPath });
+        }
+        return JSON.stringify({ success: true, emailed_to: emailTo, pdf_path: result.pdfPath, diff_summary: result.diffSummary });
+      }
+      // PDF not generated — send YAML path instead
+      return JSON.stringify({ success: true, pdf_generated: false, yaml_path: result.variantYamlPath, diff_summary: result.diffSummary, message: 'PDF not available — resume generator may not be running. YAML variant saved.' });
+    }
+
+    case 'resume_batch': {
+      const roles = input.roles as Array<{ company_name: string; role_title: string; job_description: string }>;
+      const batchPageId = await notionLogger.createTaskPage(
+        `Resume Batch — ${new Date().toISOString().split('T')[0]}`,
+        `${roles.length} resumes`
+      );
+      const targets = roles.map(r => ({
+        companyName: r.company_name,
+        roleTitle: r.role_title,
+        jobDescription: r.job_description,
+      }));
+      const results = await generateBatch(targets, batchPageId);
+      const link = notionLogger.pageUrl(batchPageId);
+      await sendIMessage(ISAIAH, `${results.length} resume(s) ready — Check Notion: ${link}`);
+      return JSON.stringify({
+        success: true,
+        count: results.length,
+        notion_page: link,
+      });
+    }
+
+    case 'checkout_status': {
+      const checkouts = await listActiveCheckouts();
+      if (checkouts.length === 0) {
+        return JSON.stringify({ message: 'No active task checkouts.' });
+      }
+      const lines = checkouts.map(c => `${c.beadId} -> ${c.agentId}`).join('\n');
+      return JSON.stringify({ active_checkouts: lines });
+    }
+
+    case 'ios_build': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+      const { success, output } = await runBuildCheck(project);
+      const buildPageId = await notionLogger.createTaskPage(`${project.name} Build Check`, '');
+      await notionLogger.logPhaseComplete(
+        buildPageId,
+        { number: 1, id: 'build', name: 'Build', prompt: '' },
+        output, success ? 0 : 1
+      );
+      return JSON.stringify({
+        success,
+        message: success ? `${project.name} build succeeded` : `${project.name} build failed - details in Notion`,
+        notion: notionLogger.pageUrl(buildPageId)
+      });
+    }
+
+    case 'ios_clean': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+      await execAsync(`rm -rf ~/Library/Developer/Xcode/DerivedData/${project.xcodeSchemeName}*`).catch(() => {});
+      await execAsync(`xcodebuild clean -scheme ${project.xcodeSchemeName}`, { cwd: project.localPath }).catch(() => {});
+      return JSON.stringify({ message: `${project.name} derived data cleared and project cleaned` });
+    }
+
+    case 'ios_status': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+      const { stdout: beads } = await execAsync(`bd list --status open 2>/dev/null || echo "No open beads"`).catch(() => ({ stdout: 'Beads unavailable' }));
+      const { stdout: commits } = await execAsync(`git -C ${project.localPath} log --oneline -5`).catch(() => ({ stdout: 'No commits' }));
+      return JSON.stringify({ project: project.name, open_beads: beads.trim(), recent_commits: commits.trim() });
+    }
+
+    case 'ios_pr': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+      const { stdout: branch } = await execAsync(`git -C ${project.localPath} branch --show-current`);
+      const prPageId = await notionLogger.createTaskPage(`${project.name} PR — ${input.title}`, '');
+      await notionLogger.logPRDraft(prPageId, {
+        branch: branch.trim(),
+        beadIds: [],
+        phases: 1,
+        testCoverage: 'See Notion'
+      });
+      const link = notionLogger.pageUrl(prPageId);
+      const stamp = await createApproval(`pr-${project.id}`, `Push ${branch.trim()} and open PR`);
+      return JSON.stringify({
+        message: `PR draft ready. Check Notion: ${link}\n\nReply "yes ${stamp}" to push branch and open PR. ${formatStamp(stamp)}`,
+        requires_approval: true,
+        approval_id: stamp,
+        branch: branch.trim()
+      });
+    }
+
+    case 'ios_review': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+      const reviewPageId = await notionLogger.createTaskPage(`${project.name} Code Review`, '');
+      const session = { sessionId: `review-${Date.now()}`, beadId: 'review', taskName: 'Review', notionPageId: reviewPageId, startedAt: new Date(), phases: [] };
+      const result = await runReviewAgent(session, project.localPath, project.defaultBranch, 'Ad-hoc review', reviewPageId);
+      const link = notionLogger.pageUrl(reviewPageId);
+      return JSON.stringify({
+        status: result.status,
+        concerns: result.concerns,
+        suggestions: result.suggestions,
+        notion: link
+      });
+    }
+
+    case 'ios_run_overnight': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+      // Fire and forget — runs async, reports via iMessage at completion
+      runOvernightSession(input.project_id as string).catch(err =>
+        sendIMessage(ISAIAH, `Overnight run failed for ${project.name}: ${err.message}`)
+      );
+      return JSON.stringify({ message: `${project.name} overnight run started. You'll get an iMessage when complete.` });
+    }
+
+    case 'ios_start_bead': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+      const claimed = await atomicClaim(input.bead_id as string, `manual-${Date.now()}`);
+      if (!claimed) return JSON.stringify({ error: `${input.bead_id} is already being worked on.` });
+      return JSON.stringify({ message: `Claimed ${input.bead_id} for ${project.name}. Starting execution...` });
     }
 
     default:

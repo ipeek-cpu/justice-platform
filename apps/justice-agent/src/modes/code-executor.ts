@@ -7,8 +7,9 @@
 
 import { spawn } from 'child_process';
 import { sendIMessage } from '@justice/messaging';
+import { atomicClaim, renewClaim, cleanupTask } from '@justice/shared-types';
 import { notionLogger, type WorkPhase } from '../integrations/notion-logger';
-import { getRedis } from '../integrations/redis-client';
+import { createApproval, getApproval, formatStamp } from '../integrations/approval-gate';
 
 export interface PhaseResult {
   phaseId: string;
@@ -32,6 +33,21 @@ export interface TaskSession {
  */
 export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<PhaseResult> {
   const start = Date.now();
+
+  // Only check claim on first phase — session already owns it after that
+  if (phase.number === 1) {
+    const claimed = await atomicClaim(session.beadId, session.sessionId);
+    if (!claimed) {
+      const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
+      if (approvedNumber) {
+        await sendIMessage(approvedNumber,
+          `Task ${session.beadId} is already running in another session. Skipping.`
+        );
+      }
+      return { phaseId: phase.id, success: false, output: 'Already claimed', duration: '0m' };
+    }
+  }
+
   await notionLogger.logPhaseStart(session.notionPageId, phase);
 
   return new Promise((resolve) => {
@@ -43,6 +59,11 @@ export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
     });
+
+    // Renew task checkout TTL every 15 minutes
+    const renewInterval = setInterval(() => {
+      renewClaim(session.beadId, session.sessionId).catch(console.error);
+    }, 15 * 60 * 1000);
 
     // Flush partial output to Notion every 15 seconds
     const flushInterval = setInterval(async () => {
@@ -62,6 +83,7 @@ export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<
 
     child.on('close', async (code) => {
       clearInterval(flushInterval);
+      clearInterval(renewInterval);
       const exitCode = code ?? 1;
       const output = chunks.join('');
       const durationMs = Date.now() - start;
@@ -72,11 +94,14 @@ export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<
       const statusEmoji = exitCode === 0 ? 'Done' : 'Failed';
       const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
       if (approvedNumber) {
+        const stamp = await createApproval(session.sessionId, `Phase ${phase.number} ${statusEmoji}: ${phase.name}`);
         await sendIMessage(
           approvedNumber,
-          `Phase ${phase.number} ${statusEmoji}: ${phase.name} (${duration})\nNotion: ${notionLogger.pageUrl(session.notionPageId)}\nReply YES to continue or NO to stop.`
+          `Phase ${phase.number} ${statusEmoji}: ${phase.name} (${duration}) ${formatStamp(stamp)}\nNotion: ${notionLogger.pageUrl(session.notionPageId)}\nReply "yes ${stamp}" to continue or "no ${stamp}" to stop.`
         );
       }
+
+      await cleanupTask(session.beadId, session.sessionId);
 
       resolve({
         phaseId: phase.id,
@@ -90,7 +115,7 @@ export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<
 
 /**
  * Wait for Isaiah's approval via Redis polling.
- * Sets a pending key, pings Isaiah, then polls every 5s.
+ * Creates a stamped approval, pings Isaiah, then polls every 5s.
  * Resolves true (YES) or false (NO). Rejects on timeout (default 24h).
  */
 export async function waitForApproval(
@@ -98,30 +123,31 @@ export async function waitForApproval(
   question: string,
   timeoutMs = 24 * 60 * 60 * 1000
 ): Promise<boolean> {
-  const key = `justice:approval:${session.sessionId}`;
-  const redis = getRedis();
-
-  await redis.set(key, 'PENDING');
-  await notionLogger.logQuestion(session.notionPageId, question);
+  const stamp = await createApproval(session.sessionId, question);
+  await notionLogger.logQuestion(session.notionPageId, `${formatStamp(stamp)} ${question}`);
 
   const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
   if (approvedNumber) {
-    await sendIMessage(approvedNumber, `Justice needs approval: ${question}\nReply YES or NO.`);
+    await sendIMessage(approvedNumber, `Justice needs approval: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`);
   }
 
   return new Promise((resolve, reject) => {
     const poll = setInterval(async () => {
       try {
-        const val = await redis.get(key);
-        if (val === 'YES') {
+        const approval = await getApproval(stamp);
+        if (!approval) {
           clearInterval(poll);
           clearTimeout(timeout);
-          await redis.del(key);
+          resolve(false);
+          return;
+        }
+        if (approval.status === 'YES') {
+          clearInterval(poll);
+          clearTimeout(timeout);
           resolve(true);
-        } else if (val === 'NO') {
+        } else if (approval.status === 'NO') {
           clearInterval(poll);
           clearTimeout(timeout);
-          await redis.del(key);
           resolve(false);
         }
       } catch {
@@ -129,10 +155,9 @@ export async function waitForApproval(
       }
     }, 5000);
 
-    const timeout = setTimeout(async () => {
+    const timeout = setTimeout(() => {
       clearInterval(poll);
-      await redis.del(key);
-      reject(new Error(`Approval timeout after ${timeoutMs}ms for session ${session.sessionId}`));
+      reject(new Error(`Approval timeout after ${timeoutMs}ms for ${formatStamp(stamp)}`));
     }, timeoutMs);
   });
 }

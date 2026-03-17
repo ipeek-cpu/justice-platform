@@ -83,7 +83,7 @@ async function getLastLinkedInOutreachDate(): Promise<string | null> {
   } catch { return null; }
 }
 
-function readState(): Record<string, string> {
+export function readState(): Record<string, string> {
   const file = path.join(process.env.HOME!, 'Developer/justice-repo/memory/state.json');
   if (!fs.existsSync(file)) return {};
   return JSON.parse(fs.readFileSync(file, 'utf8'));

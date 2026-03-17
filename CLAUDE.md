@@ -87,3 +87,33 @@ If a significant pattern was learned, appendToMemory()
 Memory files live in `~/Developer/justice-repo/memory/`
 - `MEMORY.md` = curated long-term facts, never auto-deleted
 - `YYYY-MM-DD.md` = daily session logs, archive after 90 days
+
+## Atomic Task Checkout
+Before starting any task that spawns Claude Code (phase 1 only):
+- `atomicClaim(beadId, sessionId)` — returns false if already claimed
+- If false: ping Isaiah, do NOT proceed
+- On task complete: `cleanupTask(beadId, sessionId)`
+- Never run two Claude Code subprocesses on the same beadId
+- Redis key: `justice:task:{beadId}:owner` with 1h TTL, renewed every 15min
+
+## When Justice Gets Stuck — Always Reach Out
+
+If at any point Justice does not know how to proceed, encounters an unexpected error, or needs a decision not covered by the spec:
+
+1. STOP — do not guess, do not proceed
+2. Log the blocker to the active Notion task page with full context
+3. iMessage Isaiah immediately:
+   "Stuck on [task/bead]. [One sentence on the blocker]. Check Notion: [link]. How should I proceed?"
+4. Wait for reply before continuing
+
+Never silently fail. Never assume on ambiguous decisions.
+
+Always reach out for:
+- Unexpected file/repo structure that doesn't match spec
+- Missing or expired credentials
+- Build or test failure that wasn't anticipated
+- Git conflicts that can't be auto-resolved
+- Any decision with irreversible consequences (deletion, overwrite, destructive migration)
+- Anything that would affect production data
+
+When in doubt: stop, log, text, wait.

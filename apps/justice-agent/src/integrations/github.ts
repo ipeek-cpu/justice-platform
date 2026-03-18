@@ -24,16 +24,22 @@ export async function ensureRepo(project: GitProject): Promise<void> {
   }
 }
 
-// Create a new branch for a task
-// Branch name: feature/bd-[beadId]-[short-name]
+// Create or switch to a task branch
+// Branch name: feature/[beadId]-[short-name]
 export async function createTaskBranch(
   localPath: string,
   beadId: string,
   shortName: string
 ): Promise<string> {
   const branch = `feature/${beadId}-${shortName.toLowerCase().replace(/\s+/g, '-').slice(0, 30)}`;
-  await execAsync(`git -C ${localPath} checkout -b ${branch}`);
-  console.log(`[github] Created branch ${branch}`);
+  try {
+    await execAsync(`git -C ${localPath} checkout -b ${branch}`);
+    console.log(`[github] Created branch ${branch}`);
+  } catch {
+    // Branch already exists — switch to it
+    await execAsync(`git -C ${localPath} checkout ${branch}`);
+    console.log(`[github] Switched to existing branch ${branch}`);
+  }
   return branch;
 }
 
@@ -80,8 +86,10 @@ export function buildPRDescription(opts: {
   beadIds: string[];
   phases: string[];
   testCoverage: string;
+  reviewStatus?: string;
+  concerns?: string[];
 }): string {
-  return [
+  const lines = [
     `## ${opts.title}`,
     '',
     `**Branch:** \`${opts.branch}\``,
@@ -92,8 +100,37 @@ export function buildPRDescription(opts: {
     '',
     `### Test coverage`,
     opts.testCoverage,
-    '',
-    '### Status',
-    'Pending Isaiah review and merge approval.',
-  ].join('\n');
+  ];
+
+  if (opts.reviewStatus) {
+    lines.push('', `### Review agent: ${opts.reviewStatus}`);
+    if (opts.concerns && opts.concerns.length > 0) {
+      lines.push(...opts.concerns.map(c => `- ${c}`));
+    }
+  }
+
+  lines.push('', '### Status', 'Pending Isaiah review and merge approval.');
+  return lines.join('\n');
+}
+
+// Create a draft PR on GitHub via gh CLI. Returns the PR URL.
+export async function createDraftPR(
+  localPath: string,
+  title: string,
+  body: string
+): Promise<string> {
+  const fs = require('fs');
+  const bodyFile = `/tmp/pr-body-${Date.now()}.md`;
+  fs.writeFileSync(bodyFile, body, 'utf8');
+  try {
+    const { stdout } = await execAsync(
+      `gh pr create --draft --title ${JSON.stringify(title)} --body-file ${JSON.stringify(bodyFile)}`,
+      { cwd: localPath }
+    );
+    const prUrl = stdout.trim();
+    console.log(`[github] Draft PR created: ${prUrl}`);
+    return prUrl;
+  } finally {
+    fs.unlinkSync(bodyFile);
+  }
 }

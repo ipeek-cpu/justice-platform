@@ -5,11 +5,15 @@
  * and requires Isaiah's explicit approval via iMessage + Redis.
  */
 
-import { spawn } from 'child_process';
+import { spawn, exec } from 'child_process';
+import { promisify } from 'util';
 import { sendIMessage } from '@justice/messaging';
 import { atomicClaim, renewClaim, cleanupTask } from '@justice/shared-types';
 import { notionLogger, type WorkPhase } from '../integrations/notion-logger';
 import { createApproval, getApproval, formatStamp } from '../integrations/approval-gate';
+import { executionLogger } from '../integrations/execution-logger';
+
+const execAsync = promisify(exec);
 
 export interface PhaseResult {
   phaseId: string;
@@ -27,15 +31,22 @@ export interface TaskSession {
   phases: WorkPhase[];
 }
 
+export interface RunPhaseOptions {
+  /** Skip atomicClaim check — caller already owns the lock. */
+  skipClaim?: boolean;
+  /** Skip cleanupTask at end — caller will handle cleanup. */
+  skipCleanup?: boolean;
+}
+
 /**
  * Run a single phase by spawning Claude Code CLI.
  * Streams output, flushes to Notion periodically, logs final result.
  */
-export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<PhaseResult> {
+export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: RunPhaseOptions): Promise<PhaseResult> {
   const start = Date.now();
 
   // Only check claim on first phase — session already owns it after that
-  if (phase.number === 1) {
+  if (phase.number === 1 && !opts?.skipClaim) {
     const claimed = await atomicClaim(session.beadId, session.sessionId);
     if (!claimed) {
       const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
@@ -48,22 +59,48 @@ export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<
     }
   }
 
+  // Mark the bead as in_progress in beads so it's visible in `bd list`
+  await execAsync(`${process.env.HOME}/.local/bin/bd update ${session.beadId} --status in_progress`).catch(() => {});
+
   await notionLogger.logPhaseStart(session.notionPageId, phase);
+  executionLogger.log({ event: 'phase_started', beadId: session.beadId, project: session.taskName, sessionId: session.sessionId, phase: phase.number, phaseName: phase.name });
+  await notionLogger.logTimelineEvent(session.notionPageId, 'running', `Phase ${phase.number} started: ${phase.name}`);
 
   return new Promise((resolve) => {
     const chunks: string[] = [];
     const cwd = phase.workingDir ?? process.cwd();
 
+    // Strip ANTHROPIC_API_KEY so Claude Code uses the local subscription auth
+    // instead of the API key (which causes 529 rate-limit errors).
+    // Strip CLAUDECODE + CLAUDE_CODE_ENTRYPOINT so the subprocess doesn't think
+    // it's already inside a Claude Code session (causes initialization hang).
+    const { ANTHROPIC_API_KEY: _k, CLAUDECODE: _c, CLAUDE_CODE_ENTRYPOINT: _e, ...cleanEnv } = process.env;
     const child = spawn('claude', ['--dangerously-skip-permissions', '--print', phase.prompt], {
       cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: cleanEnv,
     });
+
+    executionLogger.log({ event: 'subprocess_spawned', beadId: session.beadId, pid: child.pid, phase: phase.number });
 
     // Renew task checkout TTL every 15 minutes
     const renewInterval = setInterval(() => {
       renewClaim(session.beadId, session.sessionId).catch(console.error);
     }, 15 * 60 * 1000);
+
+    // Kill subprocess if no output received for 45 minutes (stale process)
+    let staleTimer = setTimeout(() => {
+      child.kill('SIGTERM');
+      executionLogger.log({ event: 'subprocess_timeout', beadId: session.beadId, pid: child.pid, phase: phase.number, level: 'warn' });
+    }, 45 * 60 * 1000);
+
+    const resetStaleTimer = () => {
+      clearTimeout(staleTimer);
+      staleTimer = setTimeout(() => {
+        child.kill('SIGTERM');
+        executionLogger.log({ event: 'subprocess_timeout', beadId: session.beadId, pid: child.pid, phase: phase.number, level: 'warn' });
+      }, 45 * 60 * 1000);
+    };
 
     // Flush partial output to Notion every 15 seconds
     const flushInterval = setInterval(async () => {
@@ -75,21 +112,26 @@ export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<
 
     child.stdout?.on('data', (data: Buffer) => {
       chunks.push(data.toString());
+      resetStaleTimer();
     });
 
     child.stderr?.on('data', (data: Buffer) => {
       chunks.push(data.toString());
+      resetStaleTimer();
     });
 
     child.on('close', async (code) => {
       clearInterval(flushInterval);
       clearInterval(renewInterval);
+      clearTimeout(staleTimer);
       const exitCode = code ?? 1;
       const output = chunks.join('');
       const durationMs = Date.now() - start;
       const duration = `${(durationMs / 1000).toFixed(1)}s`;
 
       await notionLogger.logPhaseComplete(session.notionPageId, phase, output, exitCode);
+      executionLogger.log({ event: 'phase_complete', beadId: session.beadId, sessionId: session.sessionId, phase: phase.number, success: exitCode === 0, durationMs });
+      await notionLogger.logTimelineEvent(session.notionPageId, exitCode === 0 ? 'success' : 'failed', `Phase ${phase.number} ${exitCode === 0 ? 'complete' : 'failed'} (${duration})`);
 
       const statusEmoji = exitCode === 0 ? 'Done' : 'Failed';
       const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
@@ -99,9 +141,12 @@ export async function runPhase(session: TaskSession, phase: WorkPhase): Promise<
           approvedNumber,
           `Phase ${phase.number} ${statusEmoji}: ${phase.name} (${duration}) ${formatStamp(stamp)}\nNotion: ${notionLogger.pageUrl(session.notionPageId)}\nReply "yes ${stamp}" to continue or "no ${stamp}" to stop.`
         );
+        await notionLogger.logTimelineEvent(session.notionPageId, 'waiting', `Waiting for approval ${formatStamp(stamp)}`);
       }
 
-      await cleanupTask(session.beadId, session.sessionId);
+      if (!opts?.skipCleanup) {
+        await cleanupTask(session.beadId, session.sessionId);
+      }
 
       resolve({
         phaseId: phase.id,
@@ -144,10 +189,12 @@ export async function waitForApproval(
         if (approval.status === 'YES') {
           clearInterval(poll);
           clearTimeout(timeout);
+          executionLogger.log({ event: 'approval_received', beadId: session.beadId, sessionId: session.sessionId, approved: true });
           resolve(true);
         } else if (approval.status === 'NO') {
           clearInterval(poll);
           clearTimeout(timeout);
+          executionLogger.log({ event: 'approval_received', beadId: session.beadId, sessionId: session.sessionId, approved: false });
           resolve(false);
         }
       } catch {

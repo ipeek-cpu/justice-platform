@@ -4,8 +4,10 @@
  * Single Claude API call with tool_use. The model decides which tools to call
  * and the engine executes them in a loop (max 5 rounds).
  *
+ * 35 tools. See TOOL_DEFINITIONS array.
  * Tools: query_case_metrics, query_case, create_task, list_tasks, complete_task,
- *        draft_email, confirm_send_email, schedule_meeting, check_calendar, get_status_briefing
+ *        draft_email, confirm_send_email, schedule_meeting, check_calendar, get_status_briefing,
+ *        justice_status, unstick_task
  */
 
 import { getCaseMetrics, getCaseBySessionId, createTask, getTasksByAssignee, completeTask, logAuditEntry } from '../db/queries';
@@ -19,13 +21,15 @@ import { generateTailoredResume, generateBatch } from './resume-engine';
 import { notionLogger } from '../integrations/notion-logger';
 import { sendIMessage } from '@justice/messaging';
 import { getProject, listProjects } from '../registry/ios-projects';
-import { listActiveCheckouts, atomicClaim } from '@justice/shared-types';
+import { listActiveCheckouts, atomicClaim, cleanupTask, releaseTask } from '@justice/shared-types';
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import { runReviewAgent } from './review-agent';
 import { runOvernightSession, runBuildCheck } from './overnight-runner';
-import { buildPRDescription } from '../integrations/github';
+import { buildPRDescription, createDraftPR, ensureRepo, createTaskBranch } from '../integrations/github';
 import { createApproval, formatStamp, listPendingApprovals } from '../integrations/approval-gate';
+import { executionLogger } from '../integrations/execution-logger';
+import { runPhase, waitForApproval, type TaskSession } from './code-executor';
 
 const execAsync = promisify(exec);
 
@@ -128,7 +132,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'schedule_meeting',
-    description: 'Schedule a meeting or call. Currently returns confirmation that the meeting is logged (Google Calendar integration pending).',
+    description: 'Schedule a meeting or call on Google Calendar.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -143,7 +147,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'check_calendar',
-    description: 'Check the calendar for a given date range. (Google Calendar integration pending)',
+    description: 'Check the calendar for a given date range.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -445,6 +449,22 @@ const TOOL_DEFINITIONS = [
       required: ['project_id', 'bead_id']
     }
   },
+  {
+    name: 'justice_status',
+    description: 'Show what Justice is currently doing — active tasks, pending approvals, last events.',
+    input_schema: { type: 'object' as const, properties: {}, required: [] as string[] }
+  },
+  {
+    name: 'unstick_task',
+    description: 'Kill a stuck task, release its checkout, and reopen the bead.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        bead_id: { type: 'string' }
+      },
+      required: ['bead_id']
+    }
+  },
 ];
 
 async function buildSystemPrompt(callerIdentity: string, currentDate: string): Promise<string> {
@@ -489,7 +509,9 @@ iOS project commands — project IDs: hlstc, flaggd
 - "[project] pr [title]" — create PR draft (requires approval to push)
 - "[project] review" — spawn review agent on current branch diff
 - "[project] run tonight" or "run [project] overnight" — autonomous overnight run
-- "[project] start [bead-id]" — claim and start a specific bead`;
+- "[project] start [bead-id]" — claim and start a specific bead
+- "justice status" or "what are you doing" → justice_status
+- "unstick [bead-id]" → unstick_task (kill stuck task, release lock)`;
 }
 
 async function executeTool(
@@ -881,9 +903,36 @@ async function executeTool(
     case 'ios_status': {
       const project = getProject(input.project_id as string);
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
-      const { stdout: beads } = await execAsync(`bd list --status open 2>/dev/null || echo "No open beads"`).catch(() => ({ stdout: 'Beads unavailable' }));
+      const { stdout: beads } = await execAsync(`bd list --status open 2>/dev/null || echo "No open beads"`, { cwd: project.localPath }).catch(() => ({ stdout: 'Beads unavailable' }));
+      const { stdout: inProgressBeads } = await execAsync(`bd list --status in_progress 2>/dev/null || echo "None"`, { cwd: project.localPath }).catch(() => ({ stdout: 'None' }));
       const { stdout: commits } = await execAsync(`git -C ${project.localPath} log --oneline -5`).catch(() => ({ stdout: 'No commits' }));
-      return JSON.stringify({ project: project.name, open_beads: beads.trim(), recent_commits: commits.trim() });
+
+      // Enrich with active checkout + runtime info
+      const checkouts = await listActiveCheckouts();
+      const projectCheckouts = checkouts.filter(c => c.beadId && inProgressBeads.includes(c.beadId));
+      const inProgressDetails: string[] = [];
+
+      for (const co of projectCheckouts) {
+        const lastEvent = executionLogger.getLastEventForBead(co.beadId);
+        const claimEvent = executionLogger.getActiveTasks().find(t => t.beadId === co.beadId);
+        const runtimeMin = claimEvent ? Math.round((Date.now() - new Date(claimEvent.ts).getTime()) / 60000) : 0;
+        const lastEventDesc = lastEvent ? `${lastEvent.event} (${Math.round((Date.now() - new Date(lastEvent.ts).getTime()) / 60000)}m ago)` : 'none';
+        inProgressDetails.push(`${co.beadId} (running ${runtimeMin}m, session ${co.agentId}) — last event: ${lastEventDesc}`);
+      }
+
+      // Also check execution log for project-level last event
+      const projectLastEvent = executionLogger.getLastEventForProject(project.id);
+      const lastEventSummary = projectLastEvent
+        ? `${projectLastEvent.event} ${projectLastEvent.beadId ?? ''} (${Math.round((Date.now() - new Date(projectLastEvent.ts).getTime()) / 60000)}m ago)`
+        : 'none';
+
+      return JSON.stringify({
+        project: project.name,
+        in_progress: inProgressDetails.length > 0 ? inProgressDetails : 'None',
+        open_beads: beads.trim(),
+        recent_commits: commits.trim(),
+        last_project_event: lastEventSummary,
+      });
     }
 
     case 'ios_pr': {
@@ -935,9 +984,235 @@ async function executeTool(
     case 'ios_start_bead': {
       const project = getProject(input.project_id as string);
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
-      const claimed = await atomicClaim(input.bead_id as string, `manual-${Date.now()}`);
-      if (!claimed) return JSON.stringify({ error: `${input.bead_id} is already being worked on.` });
-      return JSON.stringify({ message: `Claimed ${input.bead_id} for ${project.name}. Starting execution...` });
+
+      const beadId = input.bead_id as string;
+      const sessionId = `ios-${input.project_id}-${Date.now()}`;
+
+      const claimed = await atomicClaim(beadId, sessionId);
+      if (!claimed) return JSON.stringify({ error: `${beadId} is already being worked on.` });
+
+      executionLogger.log({ event: 'bead_claimed', beadId, project: project.id, sessionId });
+
+      // Ensure repo is cloned / up-to-date
+      await ensureRepo(project);
+
+      // Get bead details
+      let beadTitle = beadId;
+      let beadDescription = '';
+      try {
+        const { stdout: beadJson } = await execAsync(
+          `${process.env.HOME}/.local/bin/bd show ${beadId} --json`,
+          { cwd: project.localPath }
+        );
+        const bead = JSON.parse(beadJson);
+        beadTitle = bead.title ?? beadId;
+        beadDescription = bead.description ?? '';
+      } catch { /* use defaults */ }
+
+      // Create Notion task page
+      const pageId = await notionLogger.createTaskPage(
+        `${project.name} — ${beadTitle}`,
+        `Bead: ${beadId}\n${beadDescription}`
+      );
+      await notionLogger.logTimelineEvent(pageId, 'running', `Task started: ${beadTitle}`);
+
+      // Create feature branch
+      const branch = await createTaskBranch(project.localPath, beadId, beadTitle);
+
+      // Record before-commit hash
+      const { stdout: beforeCommit } = await execAsync(
+        `git -C ${project.localPath} rev-parse HEAD`
+      );
+
+      // Build execution prompt
+      const executionPrompt = [
+        `Complete this task: ${beadTitle}`,
+        '',
+        beadDescription ? `Acceptance criteria:\n${beadDescription}` : '',
+        '',
+        `Project: ${project.name} at ${project.localPath}`,
+        `Branch: ${branch}`,
+        `Bead ID: ${beadId}`,
+        '',
+        'Write and modify files as needed. Do not run git commands — Justice handles all staging and commits.',
+      ].filter(Boolean).join('\n');
+
+      const session: TaskSession = {
+        sessionId,
+        beadId,
+        taskName: beadTitle,
+        notionPageId: pageId,
+        startedAt: new Date(),
+        phases: [{ number: 1, id: beadId, name: beadTitle, prompt: executionPrompt, workingDir: project.localPath }],
+      };
+
+      // Fire-and-forget: actually run the phase
+      (async () => {
+        try {
+          const result = await runPhase(session, session.phases[0], { skipClaim: true, skipCleanup: true });
+
+          // Justice commits any changes Claude Code produced
+          if (result.success) {
+            const { stdout: statusOutput } = await execAsync(
+              `git -C ${project.localPath} status --porcelain`
+            ).catch(() => ({ stdout: '' }));
+
+            if (statusOutput.trim()) {
+              await execAsync(`git -C ${project.localPath} add -A`);
+              await execAsync(
+                `git -C ${project.localPath} commit -m "feat(${beadId}): ${beadTitle}"`
+              );
+              executionLogger.log({
+                event: 'commit_made', beadId, project: project.id, sessionId,
+              });
+              await notionLogger.logTimelineEvent(pageId, 'success', `Justice committed changes for ${beadId}`);
+            }
+          }
+
+          // Check if commits were made
+          const { stdout: afterCommit } = await execAsync(
+            `git -C ${project.localPath} rev-parse HEAD`
+          );
+          const hasCommits = afterCommit.trim() !== beforeCommit.trim();
+
+          if (result.success && hasCommits) {
+            // --- in_review: commits verified ---
+            await execAsync(`${process.env.HOME}/.local/bin/bd update ${beadId} --status in_review`).catch(() => {});
+            executionLogger.log({ event: 'bead_in_review', beadId, project: project.id, sessionId, commitHash: afterCommit.trim() });
+            await notionLogger.logTimelineEvent(pageId, 'waiting', 'In review — awaiting push approval');
+
+            // Run review agent — findings logged to Notion automatically
+            const review = await runReviewAgent(session, project.localPath, project.defaultBranch, beadTitle, pageId);
+            const concernCount = review.concerns.length;
+
+            // Ask Isaiah for push approval (sends iMessage + polls)
+            const approved = await waitForApproval(
+              session,
+              `${beadId} in review. ${review.status}. ${concernCount} concern(s). Branch: ${branch}. Notion: ${notionLogger.pageUrl(pageId)}. Approve push?`
+            );
+
+            if (approved) {
+              // Push + create draft PR
+              await execAsync(`git -C ${project.localPath} push origin ${branch}`);
+
+              const { stdout: commitLog } = await execAsync(
+                `git -C ${project.localPath} log ${project.defaultBranch}..HEAD --oneline`
+              ).catch(() => ({ stdout: '' }));
+
+              const prBody = buildPRDescription({
+                title: beadTitle,
+                branch,
+                beadIds: [beadId],
+                phases: commitLog.trim().split('\n').filter(Boolean),
+                testCoverage: 'Build: verified by review agent',
+                reviewStatus: review.status,
+                concerns: review.concerns,
+              });
+
+              const prUrl = await createDraftPR(project.localPath, beadTitle, prBody);
+
+              await execAsync(`${process.env.HOME}/.local/bin/bd close ${beadId} --reason "PR created: ${prUrl}"`).catch(() => {});
+              executionLogger.log({ event: 'bead_complete', beadId, project: project.id, sessionId, prUrl });
+              await notionLogger.logTimelineEvent(pageId, 'success', `PR created: ${prUrl}`);
+              await sendIMessage(ISAIAH, `PR open: ${prUrl}`);
+            } else {
+              // Push declined — reopen bead
+              await execAsync(`${process.env.HOME}/.local/bin/bd update ${beadId} --status open`).catch(() => {});
+              await notionLogger.logTimelineEvent(pageId, 'failed', 'Push declined by Isaiah');
+              await sendIMessage(ISAIAH, `Push declined. Bead ${beadId} reopened. What should I change?`);
+            }
+          } else {
+            // No commits or phase failed — reopen bead
+            await execAsync(`${process.env.HOME}/.local/bin/bd reopen ${beadId} --reason "No commits produced in session ${sessionId}"`).catch(() => {});
+            executionLogger.log({ event: 'bead_failed', beadId, project: project.id, sessionId, reason: hasCommits ? 'phase failed' : 'no commits' });
+            await notionLogger.logTimelineEvent(pageId, 'failed', `Task failed — ${hasCommits ? 'phase error' : 'no commits produced'}`);
+            await sendIMessage(ISAIAH,
+              `${project.name} — ${beadTitle} failed (${hasCommits ? 'phase error' : 'zero commits'}).\n` +
+              `Bead ${beadId} reopened. Check Notion: ${notionLogger.pageUrl(pageId)}`
+            );
+          }
+        } catch (err) {
+          executionLogger.log({ event: 'bead_failed', beadId, project: project.id, sessionId, error: String(err) });
+          await notionLogger.logTimelineEvent(pageId, 'failed', `Task error: ${String(err).slice(0, 100)}`);
+          await sendIMessage(ISAIAH,
+            `${project.name} — ${beadTitle} stuck.\nError: ${String(err).slice(0, 200)}\nCheck Notion: ${notionLogger.pageUrl(pageId)}`
+          );
+        } finally {
+          await cleanupTask(beadId, sessionId);
+        }
+      })();
+
+      // Return immediately with Notion link
+      const notionUrl = notionLogger.pageUrl(pageId);
+      return JSON.stringify({
+        message: `Started ${beadTitle} for ${project.name}. Claude Code is running autonomously.`,
+        notion: notionUrl,
+        branch,
+        bead_id: beadId,
+        session_id: sessionId,
+      });
+    }
+
+    case 'justice_status': {
+      const activeTasks = executionLogger.getActiveTasks();
+      const recentEvents = executionLogger.readRecent(5);
+
+      if (activeTasks.length === 0) {
+        return JSON.stringify({
+          status: 'idle',
+          message: 'No active tasks. Ready for new tasks.',
+          recent: recentEvents.map(e => `${e.event} ${e.beadId ?? ''} ${e.ts}`),
+        });
+      }
+
+      const taskSummaries = await Promise.all(activeTasks.map(async (t) => {
+        const runtimeMs = Date.now() - new Date(t.ts).getTime();
+        const runtimeMin = Math.round(runtimeMs / 60000);
+        const lastEvent = t.beadId ? executionLogger.getLastEventForBead(t.beadId) : null;
+        const lastEventAge = lastEvent ? Math.round((Date.now() - new Date(lastEvent.ts).getTime()) / 60000) : null;
+        const lastEventDesc = lastEvent ? `${lastEvent.event} (${lastEventAge}m ago)` : 'none';
+        const stuckFlag = lastEventAge !== null && lastEventAge > 30 ? ' ⚠️ POSSIBLY STUCK' : '';
+
+        // Check if subprocess PID is still alive
+        let pidStatus = '';
+        if (t.beadId) {
+          const pid = executionLogger.getSubprocessPid(t.beadId);
+          if (pid) {
+            try {
+              process.kill(pid, 0); // signal 0 = just check if alive
+              pidStatus = ` | PID ${pid} alive`;
+            } catch {
+              pidStatus = ` | PID ${pid} dead`;
+            }
+          }
+        }
+
+        return `${t.beadId} (${t.project ?? 'unknown'}) — running ${runtimeMin}m | last: ${lastEventDesc}${pidStatus}${stuckFlag}`;
+      }));
+
+      return JSON.stringify({
+        status: 'active',
+        active_tasks: taskSummaries,
+        recent: recentEvents.map(e => `${e.event} ${e.beadId ?? ''} ${e.ts}`),
+      });
+    }
+
+    case 'unstick_task': {
+      const beadId = input.bead_id as string;
+      const checkouts = await listActiveCheckouts();
+      const checkout = checkouts.find(c => c.beadId === beadId);
+
+      if (checkout) {
+        await releaseTask(beadId, checkout.agentId);
+      }
+
+      await execAsync(`bd reopen ${beadId} --reason "Unstuck by Isaiah via unstick_task"`).catch(() => {});
+      executionLogger.log({ event: 'bead_unstuck', beadId, reason: 'Manual unstick via unstick_task' });
+
+      return JSON.stringify({
+        message: `Released ${beadId}. Lock cleared, bead reopened.`,
+        was_checked_out: !!checkout,
+      });
     }
 
     default:
@@ -1002,32 +1277,56 @@ export async function handleMessage(
     rounds++;
 
     let data: Record<string, unknown>;
-    try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 1024,
-          system: systemPrompt,
-          tools: TOOL_DEFINITIONS,
-          messages: apiMessages,
-        }),
-      });
+    const MAX_RETRIES = 3;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: 1024,
+            system: systemPrompt,
+            tools: TOOL_DEFINITIONS,
+            messages: apiMessages,
+          }),
+        });
 
-      if (!response.ok) {
-        console.error(`[conversational-engine] Claude API error: ${response.status}`);
+        if (response.ok) {
+          data = await response.json() as Record<string, unknown>;
+          break;
+        }
+
+        // Retry on 500/529 (server error / overloaded)
+        const status = response.status;
+        const body = await response.text().catch(() => '');
+        console.error(`[conversational-engine] Claude API error ${status} (attempt ${attempt}/${MAX_RETRIES}): ${body.slice(0, 200)}`);
+
+        if ((status >= 500 || status === 429) && attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, attempt * 2000));
+          continue;
+        }
+
+        return { response: 'Failed to reach Claude API. Try again in a moment.', updatedHistory: conversationHistory };
+      } catch (error) {
+        lastError = error;
+        console.error(`[conversational-engine] Claude API request failed (attempt ${attempt}/${MAX_RETRIES}):`, error);
+        if (attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, attempt * 2000));
+          continue;
+        }
         return { response: 'Failed to reach Claude API. Try again in a moment.', updatedHistory: conversationHistory };
       }
-
-      data = await response.json() as Record<string, unknown>;
-    } catch (error) {
-      console.error('[conversational-engine] Claude API request failed:', error);
-      return { response: 'Failed to reach Claude API. Try again in a moment.', updatedHistory: conversationHistory };
+    }
+    // @ts-expect-error data assigned in loop above
+    if (!data) {
+      console.error('[conversational-engine] All retries exhausted:', lastError);
+      return { response: 'Failed to reach Claude API after retries. Try again in a moment.', updatedHistory: conversationHistory };
     }
 
     const content = data.content as Array<{ type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> }>;

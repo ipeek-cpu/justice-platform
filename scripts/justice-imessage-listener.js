@@ -48,10 +48,21 @@ function normalizePhone(raw) {
  */
 function extractTextFromAttributedBodyHex(hex) {
   if (!hex) return null;
-  const marker = '4E53537472696E67019484012B';
-  const idx = hex.indexOf(marker);
-  if (idx === -1) return null;
-  const afterMarker = hex.substring(idx + marker.length);
+  // Try NSString marker (simple messages)
+  // Then NSMutableString+NSString marker (rich messages with calendar data, links, etc.)
+  const markers = [
+    '4E53537472696E67019484012B',                                         // NSString + header
+    '4E534D757461626C65537472696E67018484084E53537472696E67019584012B',   // NSMutableString + NSString + header
+  ];
+  let afterMarker = null;
+  for (const marker of markers) {
+    const idx = hex.indexOf(marker);
+    if (idx !== -1) {
+      afterMarker = hex.substring(idx + marker.length);
+      break;
+    }
+  }
+  if (!afterMarker) return null;
   // Next byte(s) encode the string length, then text follows until 8684 terminator
   // Read first byte as length indicator
   const lenByte = parseInt(afterMarker.substring(0, 2), 16);

@@ -1,49 +1,38 @@
-import * as path from 'path';
+import { loadProjectRegistry } from './project-registry';
 
 export interface iOSProject {
   id: string;
   name: string;
+  repoOrg: string;
+  repoName: string;
   githubUrl: string;
   localPath: string;
   defaultBranch: string;
   stack: 'SwiftUI' | 'UIKit' | 'TypeScript' | 'mixed';
-  deploymentTarget: string;
-  notionHubUrl?: string;
   xcodeSchemeName: string;
+  xcodeRoot?: string;
+  notionHubUrl?: string;
+  batchLogsPageId: string;
+  phaseSequence: string[];
   description: string;
 }
 
-export const IOS_PROJECTS: iOSProject[] = [
-  {
-    id: 'hlstc',
-    name: 'HLSTC',
-    githubUrl: 'https://github.com/theaionlab/hlstc-app',
-    localPath: path.join(process.env.HOME!, 'Developer/ios/hlstc-app'),
-    defaultBranch: 'main',
-    stack: 'SwiftUI',
-    deploymentTarget: 'latest',
-    notionHubUrl: 'https://www.notion.so/326967f4607e8185b726c61b3856ae14',
-    xcodeSchemeName: 'HLSTC',
-    description: 'AI-powered fitness and nutrition app — personal trainer in your pocket',
-  },
-  {
-    id: 'flaggd',
-    name: 'Flaggd',
-    githubUrl: 'https://github.com/theaionlab/flaggd',
-    localPath: path.join(process.env.HOME!, 'Developer/ios/flaggd'),
-    defaultBranch: 'main',
-    stack: 'TypeScript',
-    deploymentTarget: 'latest',
-    notionHubUrl: '',
-    xcodeSchemeName: 'flaggd',
-    description: 'Privacy-first iOS app analyzing dating/relationship message threads',
-  },
-];
+let _registry: Map<string, iOSProject> | null = null;
+
+function getRegistry(): Map<string, iOSProject> {
+  if (!_registry) _registry = loadProjectRegistry();
+  return _registry;
+}
 
 export function getProject(id: string): iOSProject | undefined {
-  return IOS_PROJECTS.find(p => p.id === id);
+  return getRegistry().get(id.toLowerCase());
 }
 
 export function listProjects(): iOSProject[] {
-  return IOS_PROJECTS;
+  return Array.from(getRegistry().values());
+}
+
+/** Force reload from env vars (used after justice_register adds a new project). */
+export function reloadRegistry(): void {
+  _registry = null;
 }

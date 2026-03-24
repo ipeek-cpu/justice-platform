@@ -32,10 +32,10 @@ export interface LearnedPattern {
 }
 
 class NotionLogger {
-  async createTaskPage(taskName: string, spec: string): Promise<string> {
+  async createTaskPage(taskName: string, spec: string, overrideParentId?: string): Promise<string> {
     try {
       const notion = getClient();
-      const parentId = process.env.JUSTICE_PARENT_PAGE_ID;
+      const parentId = overrideParentId ?? process.env.JUSTICE_PARENT_PAGE_ID;
       if (!parentId) {
         console.error('[notion-logger] JUSTICE_PARENT_PAGE_ID not set');
         return '';
@@ -80,7 +80,17 @@ class NotionLogger {
     }
   }
 
+  async createBatchPage(title: string, body: string, project?: { batchLogsPageId?: string }): Promise<string> {
+    const parentId =
+      project?.batchLogsPageId ||
+      process.env.NOTION_HLSTC_BATCH_LOGS_PAGE_ID ||  // fallback for transition
+      process.env.JUSTICE_PARENT_PAGE_ID ||
+      '';
+    return this.createTaskPage(title, body, parentId);
+  }
+
   async logPhaseStart(pageId: string, phase: WorkPhase): Promise<void> {
+    if (!pageId) return;
     try {
       const notion = getClient();
       const children: BlockObjectRequest[] = [
@@ -108,6 +118,7 @@ class NotionLogger {
   }
 
   async logPhaseComplete(pageId: string, phase: WorkPhase, output: string, exitCode: number): Promise<void> {
+    if (!pageId) return;
     try {
       const notion = getClient();
       const success = exitCode === 0;
@@ -138,6 +149,7 @@ class NotionLogger {
   }
 
   async logQuestion(pageId: string, question: string): Promise<void> {
+    if (!pageId) return;
     try {
       const notion = getClient();
       const children: BlockObjectRequest[] = [
@@ -159,6 +171,7 @@ class NotionLogger {
   }
 
   async logPRDraft(pageId: string, pr: { branch: string; beadIds: string[]; phases: number; testCoverage: string }): Promise<void> {
+    if (!pageId) return;
     try {
       const notion = getClient();
       const details = [
@@ -227,6 +240,39 @@ class NotionLogger {
       await notion.blocks.children.append({ block_id: patternPageId, children });
     } catch (err) {
       console.error('[notion-logger] logPattern failed:', err);
+    }
+  }
+
+  async logTimelineEvent(
+    pageId: string,
+    status: 'success' | 'running' | 'failed' | 'waiting',
+    message: string
+  ): Promise<void> {
+    if (!pageId) return;
+    try {
+      const notion = getClient();
+      const emojiMap = { success: '\u2705', running: '\uD83D\uDD04', failed: '\u274C', waiting: '\u23F3' };
+      const emoji = emojiMap[status];
+      const time = new Date().toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'America/Chicago',
+      });
+
+      const children: BlockObjectRequest[] = [
+        {
+          object: 'block' as const,
+          type: 'paragraph' as const,
+          paragraph: {
+            rich_text: [{ type: 'text' as const, text: { content: `${emoji} ${time} — ${message}` } }],
+          },
+        },
+      ];
+
+      await notion.blocks.children.append({ block_id: pageId, children });
+    } catch (err) {
+      console.error('[notion-logger] logTimelineEvent failed:', err);
     }
   }
 

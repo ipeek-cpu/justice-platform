@@ -41,6 +41,41 @@ function normalizePhone(raw) {
   return clean;
 }
 
+/**
+ * Extract plain text from NSAttributedString hex dump.
+ * Structure: ...4E53537472696E67 019484012B [length] [UTF-8 text bytes] 8684...
+ * The marker "4E53537472696E67019484012B" = "NSString" + typedstream header.
+ */
+function extractTextFromAttributedBodyHex(hex) {
+  if (!hex) return null;
+  const marker = '4E53537472696E67019484012B';
+  const idx = hex.indexOf(marker);
+  if (idx === -1) return null;
+  const afterMarker = hex.substring(idx + marker.length);
+  // Next byte(s) encode the string length, then text follows until 8684 terminator
+  // Read first byte as length indicator
+  const lenByte = parseInt(afterMarker.substring(0, 2), 16);
+  let textHex;
+  if (lenByte < 0x80) {
+    // Simple 1-byte length
+    textHex = afterMarker.substring(2, 2 + lenByte * 2);
+  } else {
+    // Multi-byte length: lenByte & 0x7F = number of following length bytes
+    const numLenBytes = lenByte & 0x7F;
+    let strLen = 0;
+    for (let i = 0; i < numLenBytes; i++) {
+      strLen = (strLen << 8) | parseInt(afterMarker.substring(2 + i * 2, 4 + i * 2), 16);
+    }
+    const offset = 2 + numLenBytes * 2;
+    textHex = afterMarker.substring(offset, offset + strLen * 2);
+  }
+  try {
+    return Buffer.from(textHex, 'hex').toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
 function sanitizeForAppleScript(text) {
   return text
     .replace(/\*\*/g, '')           // strip markdown bold markers
@@ -106,6 +141,20 @@ async function main() {
       fs.writeFileSync(ROWID_FILE, String(row.ROWID));
       continue;
     }
+
+    // Resolve message text: prefer text column, fall back to attributedBody hex
+    const messageText = (row.text && row.text.trim())
+      ? row.text
+      : extractTextFromAttributedBodyHex(row.attributedBodyHex);
+
+    if (!messageText) {
+      log(`Skipping rowid ${row.ROWID} — no extractable text`);
+      fs.writeFileSync(ROWID_FILE, String(row.ROWID));
+      continue;
+    }
+
+    // Attach resolved text for downstream use
+    row.text = messageText;
 
     log(`Message from ${sender}: ${row.text.slice(0, 50)}${row.text.length > 50 ? '...' : ''}`);
 

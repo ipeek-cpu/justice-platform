@@ -4,7 +4,7 @@
  * Single Claude API call with tool_use. The model decides which tools to call
  * and the engine executes them in a loop (max 5 rounds).
  *
- * 35 tools. See TOOL_DEFINITIONS array.
+ * 39 tools. See TOOL_DEFINITIONS array.
  * Tools: query_case_metrics, query_case, create_task, list_tasks, complete_task,
  *        draft_email, confirm_send_email, schedule_meeting, check_calendar, get_status_briefing,
  *        justice_status, unstick_task
@@ -20,15 +20,17 @@ import { draftOutreachBatch } from './linkedin-outreach';
 import { generateTailoredResume, generateBatch } from './resume-engine';
 import { notionLogger } from '../integrations/notion-logger';
 import { sendIMessage } from '@justice/messaging';
-import { getProject, listProjects } from '../registry/ios-projects';
+import { getProject, listProjects, reloadRegistry } from '../registry/ios-projects';
 import { listActiveCheckouts, atomicClaim, cleanupTask, releaseTask } from '@justice/shared-types';
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import { runReviewAgent } from './review-agent';
 import { runOvernightSession, runBuildCheck } from './overnight-runner';
 import { buildPRDescription, createDraftPR, ensureRepo, createTaskBranch } from '../integrations/github';
+import { resolveBatchOrder, getBeadsByLabel, saveBatchState, getBatchState, getActiveBatches, deleteBatchState, runBatchAsync, type BatchState } from './batch-runner';
 import { createApproval, formatStamp, listPendingApprovals } from '../integrations/approval-gate';
 import { executionLogger } from '../integrations/execution-logger';
+import { shellExec } from '../integrations/shell-exec';
 import { runPhase, waitForApproval, type TaskSession } from './code-executor';
 
 const execAsync = promisify(exec);
@@ -376,7 +378,7 @@ const TOOL_DEFINITIONS = [
     input_schema: {
       type: 'object' as const,
       properties: {
-        project_id: { type: 'string', description: 'Project ID: hlstc or flaggd' }
+        project_id: { type: 'string', description: 'Registered project ID' }
       },
       required: ['project_id']
     }
@@ -465,6 +467,85 @@ const TOOL_DEFINITIONS = [
       required: ['bead_id']
     }
   },
+  {
+    name: 'justice_register',
+    description: 'Register a new project with Justice. Reads config from Doppler env vars.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string', description: 'Project ID (must have matching Doppler secrets)' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'ios_start_batch',
+    description: 'Run multiple beads sequentially on one branch, producing one review and one PR.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string', description: 'Registered project ID' },
+        bead_ids: { type: 'array', items: { type: 'string' }, description: 'Specific bead IDs' },
+        label: { type: 'string', description: 'Run all open beads with this label (e.g. m1-auth)' },
+        branch_name: { type: 'string', description: 'Optional custom branch name' },
+        interactive: { type: 'boolean', description: 'Set true for per-bead approvals (default: false = overnight mode)' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'ios_queue',
+    description: 'Show current batch queue status for all active batches.',
+    input_schema: { type: 'object' as const, properties: {}, required: [] as string[] }
+  },
+  {
+    name: 'ios_resume_batch',
+    description: 'Resume a paused or failed iOS batch from where it stopped. Can specify batch_id directly, or project_id to auto-find the most recent resumable batch.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        batch_id: { type: 'string', description: 'Batch ID to resume (optional if project_id given)' },
+        project_id: { type: 'string', description: 'Project ID — finds the most recent paused/failed batch for this project' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'ios_push_branch',
+    description: 'Push a batch branch and create a draft PR. Requires approval.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        project_id: { type: 'string', description: 'Registered project ID' },
+        batch_id: { type: 'string', description: 'Batch ID (optional if branch provided)' },
+        branch: { type: 'string', description: 'Branch name (optional if batch_id provided)' },
+        title: { type: 'string', description: 'PR title (optional)' }
+      },
+      required: ['project_id']
+    }
+  },
+  {
+    name: 'shell_exec',
+    description: 'Execute a whitelisted shell command on the Mac Mini. Use for git operations (including git rm --cached), bd bead management, gh CLI, file operations. Security-checked against approved command list.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        command: {
+          type: 'string',
+          description: 'Command to run. Must start with: git, bd, gh, xcodebuild, echo, cat, ls, mkdir, rm -f, mv, cp, grep, find, python3, node, curl, sed, chmod'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Working directory (optional). Defaults to justice-repo root.'
+        },
+        timeout_ms: {
+          type: 'number',
+          description: 'Timeout in ms (optional). Default 30000, max 300000.'
+        }
+      },
+      required: ['command']
+    }
+  },
 ];
 
 async function buildSystemPrompt(callerIdentity: string, currentDate: string): Promise<string> {
@@ -502,16 +583,27 @@ Nudges: I proactively remind you about upcoming and overdue tasks via iMessage. 
 
 Available actions: query case metrics, look up cases, create/list/complete tasks, draft and send emails, schedule meetings, check calendar, provide status briefings, search/read/create/update Notion pages, configure task nudges, manage morning briefs, draft LinkedIn outreach (logged to Notion, never sent directly), log facts to long-term memory, check beads task status, queue autonomous code execution tasks, manage iOS project registry, generate tailored resumes (single, batch, or generate-and-email — rephrases and reorders resume content to match job descriptions, never fabricates), email resume PDFs as attachments, check task checkout status (see which autonomous tasks are currently claimed), and manage iOS projects (build, clean, status, PR, review, overnight runs, start specific beads).
 
-iOS project commands — project IDs: hlstc, flaggd
+iOS project commands — registered projects: ${listProjects().map(p => p.id).join(', ') || '(none)'}
 - "[project] build" or "build [project]" — build with xcodebuild
 - "[project] clean" — clear DerivedData and clean build
-- "[project] status" — open beads + recent commits
+- "[project] status" — batch progress (if active), otherwise open beads + recent commits
 - "[project] pr [title]" — create PR draft (requires approval to push)
 - "[project] review" — spawn review agent on current branch diff
 - "[project] run tonight" or "run [project] overnight" — autonomous overnight run
 - "[project] start [bead-id]" — claim and start a specific bead
+- "[project] batch [label]" or "[project] batch [bead1] [bead2]..." → ios_start_batch
+- "[project] queue" or "batch status" → ios_queue
+- "resume batch [id]" → ios_resume_batch
+- "push batch [id]" or "push [project] [branch]" → ios_push_branch
 - "justice status" or "what are you doing" → justice_status
-- "unstick [bead-id]" → unstick_task (kill stuck task, release lock)`;
+- "unstick [bead-id]" → unstick_task (kill stuck task, release lock)
+- "justice register [project-id]" → justice_register (register a new project from Doppler env vars)
+
+Direct shell operations (git rm, bd create, gh, etc.) → shell_exec
+Examples:
+- "bd create 'fix: RLS policy' -t task -p 1 --label fix,hlstc"
+- "bd reopen hlstc-app-4en --reason 'No commits made'"
+- "gh pr view 166 --repo theaionlab/hlstc-app"`;
 }
 
 async function executeTool(
@@ -903,24 +995,56 @@ async function executeTool(
     case 'ios_status': {
       const project = getProject(input.project_id as string);
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+
+      // Check active batches first — usually what "status" means during a run
+      const allBatches = await getActiveBatches();
+      const projectBatches = allBatches.filter(b => b.projectId === project.id);
+
+      if (projectBatches.length > 0) {
+        const batchSummaries = projectBatches.map(b => {
+          const completed = b.results.filter(r => r.status === 'completed').length;
+          const failed = b.results.filter(r => r.status === 'failed').length;
+          const pct = b.beadOrder.length > 0
+            ? Math.round((completed / b.beadOrder.length) * 100) : 0;
+          return (
+            `batch ${b.batchId.split('-').slice(-1)[0]} — ${b.status}\n` +
+            `  ${completed}/${b.beadOrder.length} beads (${pct}%), ${failed} failed\n` +
+            `  Branch: ${b.branch}\n` +
+            `  Current: ${b.beadOrder[b.currentIndex] ?? 'post-loop'}\n` +
+            `  Notion: ${notionLogger.pageUrl(b.notionPageId)}`
+          );
+        }).join('\n\n');
+
+        const { stdout: openJson } = await execAsync(
+          `${process.env.HOME}/.local/bin/bd list --status open --json 2>/dev/null || echo "[]"`,
+          { cwd: project.localPath }
+        ).catch(() => ({ stdout: '[]' }));
+        let openCount = 0;
+        try { openCount = JSON.parse(openJson).length; } catch {}
+
+        return JSON.stringify({
+          message: `${project.name} — ${projectBatches.length} active batch(es):\n\n` +
+            batchSummaries +
+            (openCount > 0 ? `\n\n${openCount} open bead(s) queued.` : '')
+        });
+      }
+
+      // No active batches — standard status
       const { stdout: beads } = await execAsync(`bd list --status open 2>/dev/null || echo "No open beads"`, { cwd: project.localPath }).catch(() => ({ stdout: 'Beads unavailable' }));
       const { stdout: inProgressBeads } = await execAsync(`bd list --status in_progress 2>/dev/null || echo "None"`, { cwd: project.localPath }).catch(() => ({ stdout: 'None' }));
       const { stdout: commits } = await execAsync(`git -C ${project.localPath} log --oneline -5`).catch(() => ({ stdout: 'No commits' }));
 
-      // Enrich with active checkout + runtime info
       const checkouts = await listActiveCheckouts();
       const projectCheckouts = checkouts.filter(c => c.beadId && inProgressBeads.includes(c.beadId));
       const inProgressDetails: string[] = [];
-
       for (const co of projectCheckouts) {
         const lastEvent = executionLogger.getLastEventForBead(co.beadId);
         const claimEvent = executionLogger.getActiveTasks().find(t => t.beadId === co.beadId);
         const runtimeMin = claimEvent ? Math.round((Date.now() - new Date(claimEvent.ts).getTime()) / 60000) : 0;
         const lastEventDesc = lastEvent ? `${lastEvent.event} (${Math.round((Date.now() - new Date(lastEvent.ts).getTime()) / 60000)}m ago)` : 'none';
-        inProgressDetails.push(`${co.beadId} (running ${runtimeMin}m, session ${co.agentId}) — last event: ${lastEventDesc}`);
+        inProgressDetails.push(`${co.beadId} (running ${runtimeMin}m) — last: ${lastEventDesc}`);
       }
 
-      // Also check execution log for project-level last event
       const projectLastEvent = executionLogger.getLastEventForProject(project.id);
       const lastEventSummary = projectLastEvent
         ? `${projectLastEvent.event} ${projectLastEvent.beadId ?? ''} (${Math.round((Date.now() - new Date(projectLastEvent.ts).getTime()) / 60000)}m ago)`
@@ -1213,6 +1337,380 @@ async function executeTool(
         message: `Released ${beadId}. Lock cleared, bead reopened.`,
         was_checked_out: !!checkout,
       });
+    }
+
+    case 'justice_register': {
+      const projectId = (input.project_id as string).toLowerCase();
+      const prefix = projectId.toUpperCase().replace(/-/g, '_');
+
+      // Verify required env vars exist
+      const repoName = process.env[`${prefix}_REPO_NAME`];
+      const localPath = process.env[`${prefix}_LOCAL_PATH`];
+      if (!repoName || !localPath) {
+        return JSON.stringify({
+          error: `Missing Doppler secrets: ${prefix}_REPO_NAME and/or ${prefix}_LOCAL_PATH. Set them in Doppler first.`,
+        });
+      }
+
+      const repoOrg = process.env[`${prefix}_REPO_ORG`] ?? 'theaionlab';
+
+      // Clone repo if localPath doesn't exist
+      const fs = require('fs');
+      if (!fs.existsSync(localPath)) {
+        try {
+          await execAsync(`gh repo clone ${repoOrg}/${repoName} ${localPath}`);
+        } catch (err) {
+          return JSON.stringify({ error: `Clone failed: ${String(err).slice(0, 200)}` });
+        }
+      }
+
+      // Reload registry to pick up new project
+      reloadRegistry();
+      const project = getProject(projectId);
+      if (!project) {
+        return JSON.stringify({ error: `Registry reload failed — ensure JUSTICE_REGISTERED_PROJECTS includes "${projectId}"` });
+      }
+
+      return JSON.stringify({
+        message: `Registered ${project.name} (${project.id})`,
+        project: { id: project.id, name: project.name, localPath: project.localPath, stack: project.stack },
+      });
+    }
+
+    case 'ios_start_batch': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+
+      // Resolve beads: from explicit IDs or by label
+      let beads: Array<{ id: string; title: string; description: string; deps?: string[] }> = [];
+      if (input.bead_ids && (input.bead_ids as string[]).length > 0) {
+        for (const id of input.bead_ids as string[]) {
+          try {
+            const { stdout } = await execAsync(
+              `${process.env.HOME}/.local/bin/bd show ${id} --json`,
+              { cwd: project.localPath }
+            );
+            const parsed = JSON.parse(stdout);
+            const bead = Array.isArray(parsed) ? parsed[0] : parsed;
+            beads.push({ id, title: bead.title ?? id, description: bead.description ?? '', deps: (bead.dependencies ?? []).map((d: any) => d.depends_on_id) });
+          } catch {
+            beads.push({ id, title: id, description: '', deps: [] });
+          }
+        }
+      } else if (input.label) {
+        beads = await getBeadsByLabel(input.label as string, project.localPath);
+      }
+
+      if (beads.length === 0) {
+        return JSON.stringify({ error: 'No beads found. Provide bead_ids or a label with open beads.' });
+      }
+
+      // Topological sort
+      let orderedIds = resolveBatchOrder(beads);
+
+      // Guard 0: Clean up stale same-project batches before checking for conflicts
+      const activeBatches = await getActiveBatches();
+      const staleProjectBatches = activeBatches.filter(
+        b => b.projectId === project.id && b.status === 'running'
+      );
+      for (const stale of staleProjectBatches) {
+        const completedCount = stale.results.filter(r => r.status === 'completed').length;
+        if (completedCount === stale.beadOrder.length && completedCount > 0) {
+          stale.status = 'approved' as any;
+        } else {
+          stale.status = 'failed';
+        }
+        stale.updatedAt = new Date().toISOString();
+        await saveBatchState(stale);
+        await deleteBatchState(stale.batchId);
+        executionLogger.log({ event: 'stale_batch_cleaned', batchId: stale.batchId, project: project.id, newStatus: stale.status });
+      }
+
+      // Guard 1: Check for active batches with overlapping beads (re-fetch after cleanup)
+      const freshBatches = staleProjectBatches.length > 0 ? await getActiveBatches() : activeBatches;
+      const conflicting = freshBatches.find(b =>
+        b.projectId === project.id &&
+        b.beadOrder.some(id => orderedIds.includes(id))
+      );
+      if (conflicting) {
+        // Auto-resume if all beads completed but batch paused (post-loop stall)
+        const allDone = conflicting.results.length > 0 &&
+          conflicting.results.every(r => r.status === 'completed');
+
+        if (allDone && conflicting.status === 'paused') {
+          // Auto-resume — don't make Isaiah type the batch ID
+          const resumeProject = getProject(conflicting.projectId);
+          if (resumeProject) {
+            conflicting.status = 'queued';
+            await saveBatchState(conflicting);
+            runBatchAsync(conflicting, resumeProject, conflicting.sessionId).catch(err => {
+              sendIMessage(ISAIAH, `Auto-resume failed for ${conflicting.batchId}: ${String(err).slice(0, 200)}`);
+            });
+            return JSON.stringify({
+              message: `Found paused batch with all ${conflicting.results.length} beads completed. Auto-resuming for build check + review + PR.\n` +
+                `Batch: ${conflicting.batchId}\nBranch: ${conflicting.branch}`
+            });
+          }
+        }
+
+        return JSON.stringify({
+          message: `Found existing batch for this project:\n` +
+            `  Status: ${conflicting.status}\n` +
+            `  Done: ${conflicting.results.filter(r => r.status === 'completed').length}/${conflicting.beadOrder.length}\n` +
+            `  Branch: ${conflicting.branch}\n` +
+            `  Notion: ${notionLogger.pageUrl(conflicting.notionPageId)}\n\n` +
+            `To continue: "resume batch ${conflicting.batchId}"\nTo start fresh: tell me to "unstick" it first.`
+        });
+      }
+
+      // Guard 2: Check for beads already in_review
+      const inReviewIds: string[] = [];
+      for (const bead of beads) {
+        try {
+          const { stdout } = await execAsync(
+            `${process.env.HOME}/.local/bin/bd show ${bead.id} --json`,
+            { cwd: project.localPath }
+          );
+          const parsed = JSON.parse(stdout);
+          const b = Array.isArray(parsed) ? parsed[0] : parsed;
+          if (b.status === 'in_review') inReviewIds.push(bead.id);
+        } catch { /* skip */ }
+      }
+      if (inReviewIds.length === beads.length) {
+        return JSON.stringify({
+          message: `All ${inReviewIds.length} beads are already in in_review status.\nWork complete from a previous run.\n\nTo push: use ios_push_branch\nTo re-run: reopen the beads first.`
+        });
+      }
+      if (inReviewIds.length > 0) {
+        beads = beads.filter(b => !inReviewIds.includes(b.id));
+        orderedIds = resolveBatchOrder(beads);
+      }
+
+      const batchId = `batch-${project.id}-${Date.now()}`;
+      const sessionId = `ios-batch-${project.id}-${Date.now()}`;
+      const date = new Date().toISOString().split('T')[0];
+
+      // Ensure repo is ready (pulls latest on main localPath)
+      await ensureRepo(project);
+
+      // Branch name — worktree creation in runBatchAsync handles git checkout
+      const branchName = (input.branch_name as string) || `feature/batch-${input.label ?? orderedIds[0]}-${date}`;
+
+      // Create Notion page — routes to project-specific batch logs parent
+      const pageId = await notionLogger.createBatchPage(
+        `${project.name} — Batch: ${input.label ?? orderedIds.join(', ')}`,
+        `Batch ID: ${batchId}\nBeads: ${orderedIds.join(', ')}\nBranch: ${branchName}`,
+        project
+      );
+      if (!pageId) {
+        console.error(`[ios_start_batch] Notion page creation failed for batch ${batchId}`);
+        await sendIMessage(ISAIAH,
+          `Warning: Notion page creation failed for batch ${batchId}. Batch will proceed but Notion logging will be unavailable.`
+        );
+      }
+      await notionLogger.logTimelineEvent(pageId, 'running', `Batch queued: ${orderedIds.length} bead(s)`);
+
+      // Build and save batch state
+      const state: BatchState = {
+        batchId,
+        projectId: project.id,
+        branch: branchName,
+        notionPageId: pageId,
+        sessionId,
+        status: 'queued',
+        beadOrder: orderedIds,
+        currentIndex: 0,
+        results: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        overnight: !(input.interactive as boolean),
+        label: (input.label as string) ?? undefined,
+      };
+      await saveBatchState(state);
+
+      executionLogger.log({ event: 'batch_started', project: project.id, sessionId, beadIds: orderedIds });
+
+      // Fire-and-forget
+      runBatchAsync(state, project, sessionId).catch(async (err) => {
+        state.status = 'failed';
+        await saveBatchState(state);
+        executionLogger.log({ event: 'batch_failed', project: project.id, sessionId, error: String(err) });
+        await sendIMessage(ISAIAH,
+          `Batch ${batchId} crashed: ${String(err).slice(0, 200)}\nNotion: ${notionLogger.pageUrl(pageId)}`
+        );
+      });
+
+      const notionUrl = notionLogger.pageUrl(pageId);
+      return JSON.stringify({
+        message: `Batch started: ${orderedIds.length} bead(s) on branch ${branchName}. Running autonomously.`,
+        batch_id: batchId,
+        notion: notionUrl,
+        branch: branchName,
+        bead_order: orderedIds,
+      });
+    }
+
+    case 'ios_queue': {
+      const batches = await getActiveBatches();
+      if (batches.length === 0) {
+        return JSON.stringify({ message: 'No active batches.' });
+      }
+
+      const summaries = batches.map(b => {
+        const completed = b.results.filter(r => r.status === 'completed').length;
+        const failed = b.results.filter(r => r.status === 'failed').length;
+        const currentBead = b.beadOrder[b.currentIndex] ?? 'done';
+        return {
+          batch_id: b.batchId,
+          project: b.projectId,
+          status: b.status,
+          progress: `${completed}/${b.beadOrder.length} done, ${failed} failed`,
+          current_bead: currentBead,
+          branch: b.branch,
+          worktree: b.worktreePath ?? 'main',
+        };
+      });
+
+      return JSON.stringify({ active_batches: summaries });
+    }
+
+    case 'shell_exec': {
+      try {
+        const result = await shellExec(input.command as string, {
+          cwd: input.cwd as string | undefined,
+          timeoutMs: input.timeout_ms as number | undefined
+        });
+        return JSON.stringify({
+          exitCode: result.exitCode,
+          stdout: result.stdout.slice(0, 2000),
+          stderr: result.stderr.slice(0, 500),
+          success: result.exitCode === 0
+        });
+      } catch (err: any) {
+        return JSON.stringify({
+          error: err.message,
+          success: false
+        });
+      }
+    }
+
+    case 'ios_resume_batch': {
+      let batchState: BatchState | null = null;
+
+      if (input.batch_id) {
+        batchState = await getBatchState(input.batch_id as string);
+      } else if (input.project_id) {
+        // Find most recent resumable batch for this project
+        const all = await getActiveBatches();
+        const resumable = all
+          .filter(b => b.projectId === (input.project_id as string) && ['paused', 'failed', 'running'].includes(b.status))
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        batchState = resumable[0] ?? null;
+      }
+
+      if (!batchState) {
+        return JSON.stringify({ error: input.batch_id
+          ? `Batch not found: ${input.batch_id}`
+          : `No resumable batch found for project: ${input.project_id}` });
+      }
+
+      // Auto-advance: if status is 'running' but all beads are done, this is stale state
+      const completedCount = batchState.results.filter(r => r.status === 'completed').length;
+      if (batchState.status === 'running' && completedCount === batchState.beadOrder.length && completedCount > 0) {
+        batchState.status = 'paused';
+        batchState.currentIndex = batchState.beadOrder.length;
+        await saveBatchState(batchState);
+
+        const project = getProject(batchState.projectId);
+        if (!project) return JSON.stringify({ error: `Unknown project: ${batchState.projectId}` });
+
+        const sessionId = `resume-${batchState.batchId}-${Date.now()}`;
+        executionLogger.log({ event: 'batch_auto_advanced', batchId: batchState.batchId, project: project.id, sessionId });
+
+        runBatchAsync(batchState, project, sessionId).catch(async (err) => {
+          batchState.status = 'failed';
+          await saveBatchState(batchState);
+          await sendIMessage(ISAIAH,
+            `Batch ${batchState.batchId} crashed on resume: ${String(err).slice(0, 200)}\nNotion: ${notionLogger.pageUrl(batchState.notionPageId)}`
+          );
+        });
+
+        return JSON.stringify({
+          message: `Batch ${batchState.batchId} has all ${completedCount} beads complete but was stuck in 'running'. Advancing to build check + review + push approval.`,
+          batch_id: batchState.batchId,
+          notion: notionLogger.pageUrl(batchState.notionPageId),
+          branch: batchState.branch,
+        });
+      }
+
+      if (!['paused', 'failed'].includes(batchState.status)) {
+        return JSON.stringify({ error: `Batch ${batchState.batchId} is ${batchState.status} — can only resume paused or failed batches.` });
+      }
+
+      const project = getProject(batchState.projectId);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${batchState.projectId}` });
+
+      batchState.status = 'queued';
+      await saveBatchState(batchState);
+
+      const sessionId = `resume-${batchState.batchId}-${Date.now()}`;
+      executionLogger.log({ event: 'batch_resumed', batchId: batchState.batchId, project: project.id, sessionId });
+
+      runBatchAsync(batchState, project, sessionId).catch(async (err) => {
+        batchState.status = 'failed';
+        await saveBatchState(batchState);
+        executionLogger.log({ event: 'batch_failed', project: project.id, sessionId, error: String(err) });
+        await sendIMessage(ISAIAH,
+          `Batch ${batchState.batchId} crashed on resume: ${String(err).slice(0, 200)}\nNotion: ${notionLogger.pageUrl(batchState.notionPageId)}`
+        );
+      });
+
+      return JSON.stringify({
+        message: `Resuming batch ${batchState.batchId} from bead ${batchState.currentIndex + 1}/${batchState.beadOrder.length}.`,
+        batch_id: batchState.batchId,
+        notion: notionLogger.pageUrl(batchState.notionPageId),
+        branch: batchState.branch,
+      });
+    }
+
+    case 'ios_push_branch': {
+      const project = getProject(input.project_id as string);
+      if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
+
+      let branch = input.branch as string | undefined;
+      let batchState: BatchState | null = null;
+      if (!branch && input.batch_id) {
+        batchState = await getBatchState(input.batch_id as string);
+        branch = batchState?.branch;
+      }
+      if (!branch) return JSON.stringify({ error: 'Provide branch or batch_id.' });
+
+      // Ensure repo is up to date
+      await ensureRepo(project);
+
+      const pushSession: TaskSession = {
+        sessionId: `push-${branch}-${Date.now()}`,
+        beadId: `push-${branch}`,
+        taskName: `Push ${branch}`,
+        notionPageId: batchState?.notionPageId ?? '',
+        startedAt: new Date(),
+        phases: [],
+      };
+
+      const approved = await waitForApproval(pushSession,
+        `Commits on origin/${branch}. Approve PR creation for ${project.name}?`
+      );
+
+      if (approved) {
+        // Push if not already on origin
+        await execAsync(`git -C ${project.localPath} push origin ${branch}`).catch(() => {});
+
+        const prTitle = (input.title as string) || `${project.name} — ${branch}`;
+        const prUrl = await createDraftPR(project.localPath, prTitle, `Branch: ${branch}\n\nAuto-generated by Justice.`);
+
+        return JSON.stringify({ message: `PR created: ${prUrl}`, pr_url: prUrl });
+      }
+      return JSON.stringify({ message: 'Push declined.' });
     }
 
     default:

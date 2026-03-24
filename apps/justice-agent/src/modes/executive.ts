@@ -18,6 +18,9 @@
 import { isApprovedNumber, getCallerIdentity } from '../access-control/approved-numbers';
 import { handleMessage, type ConversationMessage } from './conversational-engine';
 import { logAuditEntry } from '../db/queries';
+import { cleanupStaleWorktrees } from '../integrations/github';
+import { getActiveBatches } from './batch-runner';
+import { listProjects } from '../registry/ios-projects';
 
 export interface ExecutiveSession {
   callerIdentity: 'isaiah' | 'scott';
@@ -119,13 +122,27 @@ export function validateCaller(phoneNumber: string): boolean {
   return isApprovedNumber(phoneNumber);
 }
 
-// Periodic cleanup — no-op now that pending actions are handled inside the engine
-export function runMaintenance(): void {
+// Periodic cleanup — sessions + stale worktrees
+export async function runMaintenance(): Promise<void> {
   // Expire stale sessions
   const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
   for (const [phone, session] of sessions) {
     if (new Date(session.lastActivityAt) < twoHoursAgo) {
       sessions.delete(phone);
     }
+  }
+
+  // Periodic worktree cleanup — iterate all registered projects
+  try {
+    const projects = listProjects();
+    if (projects.length === 0) return;
+
+    const activeBatches = await getActiveBatches();
+    const activeBatchIds = activeBatches.map(b => b.batchId);
+    for (const project of projects) {
+      await cleanupStaleWorktrees(project, activeBatchIds);
+    }
+  } catch (err) {
+    console.error('[maintenance] worktree cleanup error:', err);
   }
 }

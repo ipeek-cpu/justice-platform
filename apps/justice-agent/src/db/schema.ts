@@ -58,6 +58,81 @@ export const oauthTokens = pgTable('oauth_tokens', {
   unique('oauth_tokens_user_account_uniq').on(table.userIdentity, table.accountEmail),
 ]);
 
+// --- CRM Tables (WS14) ---
+
+export const attorneys = pgTable('attorneys', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  firstName: text('first_name').notNull(),
+  lastName: text('last_name').notNull(),
+  firmName: text('firm_name'),
+  email: text('email'),
+  phone: text('phone'),
+  website: text('website'),
+  linkedinUrl: text('linkedin_url'),
+  barNumber: text('bar_number'),
+  state: text('state').default('IL'),
+  city: text('city'),
+  practiceAreas: text('practice_areas').array(),
+  statutesReferenced: text('statutes_referenced').array(),
+  whistleblowerScore: integer('whistleblower_score'),
+  caseTypes: text('case_types').array(),
+  contingencyFee: boolean('contingency_fee'),
+  firmSize: text('firm_size'),
+  publiclyTradedExp: boolean('publicly_traded_exp'),
+  federalCourtExp: boolean('federal_court_exp'),
+  seventhCircuitExp: boolean('seventh_circuit_exp'),
+  notes: text('notes'),
+  source: text('source'),
+  outreachStatus: text('outreach_status').default('new'),
+  scottNotes: text('scott_notes'),
+  lastContactedAt: timestamp('last_contacted_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('idx_attorneys_score').on(table.whistleblowerScore),
+  index('idx_attorneys_state').on(table.state),
+  index('idx_attorneys_outreach_status').on(table.outreachStatus),
+]);
+
+export const crmCases = pgTable('crm_cases', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  callerPhone: text('caller_phone'),
+  callerName: text('caller_name'),
+  call1Transcript: text('call_1_transcript'),
+  call2Transcript: text('call_2_transcript'),
+  documents: jsonb('documents'),
+  factPattern: text('fact_pattern'),
+  statutesTriggered: text('statutes_triggered').array(),
+  viabilityScore: integer('viability_score'),
+  viabilityTier: text('viability_tier'),
+  elementScores: jsonb('element_scores'),
+  annualIncome: integer('annual_income'),
+  employerName: text('employer_name'),
+  employerSize: text('employer_size'),
+  publiclyTraded: boolean('publicly_traded'),
+  protectedClaims: text('protected_claims').array(),
+  status: text('status').default('intake'),
+  attorneyIds: uuid('attorney_ids').array(),
+  scottReviewed: boolean('scott_reviewed').default(false),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('idx_crm_cases_status').on(table.status),
+]);
+
+export const outreachLog = pgTable('outreach_log', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  attorneyId: uuid('attorney_id').references(() => attorneys.id),
+  caseId: uuid('case_id').references(() => crmCases.id),
+  channel: text('channel'),
+  direction: text('direction'),
+  summary: text('summary'),
+  outcome: text('outcome'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('idx_outreach_log_attorney').on(table.attorneyId),
+]);
+
 export const auditLog = pgTable('audit_log', {
   id: uuid('id').primaryKey().defaultRandom(),
   caller: text('caller').notNull(),

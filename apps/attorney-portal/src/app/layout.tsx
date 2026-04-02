@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Attorney Portal — Justice Network',
-  description: 'Case review and management portal for subscribed attorneys',
+  title: 'Wolf Law \u2014 Attorney Portal',
+  description: 'Secure case review portal for Wolf Law network attorneys',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -27,6 +27,8 @@ import { getTenantByPhone } from '../multi-tenancy/tenant-registry';
 import { getAuthUrl, handleOAuthCallback } from '../integrations/google-workspace';
 import { getCallerIdentity } from '../access-control/approved-numbers';
 import { parseApprovalReply, formatStamp } from '../integrations/approval-gate';
+import { demoStream } from '../integrations/demo-stream';
+import { processPostCallForDemo } from './demo-call-processor';
 
 const PORT = parseInt(process.env.EXECUTIVE_WEBHOOK_PORT ?? '3002', 10);
 
@@ -172,6 +174,10 @@ function handleVoiceInbound(req: IncomingMessage, res: ServerResponse, rawBody: 
     const agentId = getElevenLabsAgentId(tenantId);
     const twiml = buildVoiceTwiml(agentId, callerNumber);
     console.log(`[voice] Inbound call from ${callerNumber.slice(-4)} → tenant ${tenantId}, agent ${agentId.slice(0, 8)}`);
+    // Emit demo events for live dashboard
+    demoStream.startSession(`call-${Date.now()}`);
+    demoStream.callState('call_1_active');
+    demoStream.transcript('justice', `Hi, this is Justice with Wolf Law. I'm here to help you understand your rights.`);
     sendXml(res, 200, twiml);
   } catch (error) {
     console.error('[voice] Failed to build TwiML:', error);
@@ -192,7 +198,13 @@ function handleVoicePostCall(_req: IncomingMessage, res: ServerResponse, rawBody
   const isJson = rawBody.startsWith('{');
   if (isJson) {
     const data = JSON.parse(rawBody);
-    console.log(`[voice] Post-call transcript received: ${data.conversation_id ?? 'unknown'}`);
+    const conversationId = data.conversation_id ?? 'unknown';
+    console.log(`[voice] Post-call transcript received: ${conversationId}`);
+
+    // Process transcript for demo dashboard (async, don't block response)
+    processPostCallForDemo(data).catch(err => {
+      console.error('[voice] Demo processing failed:', err);
+    });
   } else {
     console.log('[voice] Post-call data received');
   }
@@ -202,9 +214,38 @@ function handleVoicePostCall(_req: IncomingMessage, res: ServerResponse, rawBody
 // --- Main request handler ---
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // CORS preflight for demo-portal
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Cache-Control',
+    });
+    res.end();
+    return;
+  }
+
   // Health check
   if (req.method === 'GET' && req.url === '/health') {
     sendJson(res, 200, { status: 'ok', mode: 'executive-webhook' });
+    return;
+  }
+
+  // SSE endpoint — demo dashboard subscribes here
+  if (req.method === 'GET' && req.url === '/api/demo/stream') {
+    const cleanup = demoStream.addClient(res);
+    req.on('close', cleanup);
+    return; // Keep connection open — SSE
+  }
+
+  // Manual demo trigger — POST /api/demo/trigger kicks off a simulated case package run
+  if (req.method === 'POST' && req.url === '/api/demo/trigger') {
+    const rawBody = await readBody(req);
+    const body = rawBody ? JSON.parse(rawBody) : {};
+    processPostCallForDemo(body).catch(err => {
+      console.error('[demo] Manual trigger failed:', err);
+    });
+    sendJson(res, 200, { status: 'started', message: 'Demo case processing started. Watch /api/demo/stream for events.' });
     return;
   }
 
@@ -307,10 +348,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // Check if this is an approval reply (yes/no with optional stamp)
+    // Check if this is an approval reply (yes/no with optional stamp, supports multi-stamp)
     const approvalResult = await parseApprovalReply(message.body);
     if (approvalResult.handled) {
-      const ack = `${approvalResult.decision === 'YES' ? 'Approved' : 'Denied'} ${formatStamp(approvalResult.approvalId)}.`;
+      const ack = approvalResult.results
+        .map(r => `${r.decision === 'YES' ? 'Approved' : 'Denied'} ${formatStamp(r.approvalId)}`)
+        .join('\n');
       console.log(`[executive-webhook] Approval reply: ${ack}`);
       if (isJson) {
         sendJson(res, 200, { reply: ack });
@@ -361,6 +404,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 export function startExecutiveWebhook(): void {
   const server = createServer(handleRequest);
 
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[executive-webhook] Port ${PORT} already in use — another instance is running. Exiting.`);
+      process.exit(1);
+    }
+    throw err;
+  });
+
   server.listen(PORT, () => {
     console.log(`[executive-webhook] Listening on port ${PORT}`);
     console.log(`[executive-webhook] Twilio SMS:  POST /webhook/executive (form-encoded)`);
@@ -368,10 +419,12 @@ export function startExecutiveWebhook(): void {
     console.log(`[executive-webhook] Voice:       POST /api/voice/inbound | /status | /post-call`);
     console.log(`[executive-webhook] OAuth:       GET  /api/oauth/google/authorize?user=isaiah`);
     console.log(`[executive-webhook] Health:      GET  /health`);
+    console.log(`[executive-webhook] Demo SSE:    GET  /api/demo/stream`);
+    console.log(`[executive-webhook] Demo trigger: POST /api/demo/trigger`);
   });
 
-  // Clean expired sessions every 5 minutes
-  setInterval(runMaintenance, 5 * 60 * 1000);
+  // Clean expired sessions + stale worktrees every 5 minutes
+  setInterval(() => { runMaintenance().catch(() => {}); }, 5 * 60 * 1000);
 
   process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
   process.on('SIGINT', () => { server.close(() => process.exit(0)); });

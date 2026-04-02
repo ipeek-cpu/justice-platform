@@ -71,7 +71,16 @@ function formatTime(ms: number): string {
 
 /* ─── Component ───────────────────────────────────────────────────────── */
 
+const AGENT_URL = process.env.NEXT_PUBLIC_AGENT_URL || 'http://localhost:3002';
+
+type DemoMode = 'replay' | 'live';
+
 export default function DemoPage() {
+  /* mode: 'live' when SSE stream is active, 'replay' as fallback */
+  const [mode, setMode] = useState<DemoMode>('replay');
+  const sseRef = useRef<EventSource | null>(null);
+  const liveStartTime = useRef<number>(0);
+
   /* playback state */
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -190,6 +199,139 @@ export default function DemoPage() {
         setEconomicPitch(ev.data as EconomicPitch);
         break;
     }
+  }, []);
+
+  /* ── Adapt server SSE event to the replay DemoEvent shape ──────── */
+  const adaptServerEvent = useCallback((serverEvent: { type: string; data: Record<string, unknown> }): void => {
+    switch (serverEvent.type) {
+      case 'transcript':
+        setTranscript((prev) => [...prev, { speaker: serverEvent.data.speaker as 'justice' | 'plaintiff', text: serverEvent.data.text as string }]);
+        break;
+      case 'element_update':
+        setElements((prev) => ({
+          ...prev,
+          [serverEvent.data.element as string]: {
+            status: serverEvent.data.status as ElementStatus,
+            reasoning: serverEvent.data.reasoning as string,
+          },
+        }));
+        setChangedElement(serverEvent.data.element as string);
+        setTimeout(() => setChangedElement(null), 1200);
+        break;
+      case 'statute_trigger': {
+        const name = serverEvent.data.name as string;
+        const abbr = name.replace(/^Illinois\s+/, 'IL ').replace(/Act$/, '').trim();
+        setStatutes((prev) => {
+          if (prev.find((s) => s.statute === name)) return prev;
+          return [...prev, { statute: name, label: abbr, color: 'bg-blue-500/20 text-blue-300 border-blue-500/30' }];
+        });
+        break;
+      }
+      case 'viability_update':
+        setViability(serverEvent.data.score as number);
+        setViabilityTier(serverEvent.data.tier as string);
+        break;
+      case 'call_state':
+        setCallState(serverEvent.data.state as CallState);
+        break;
+      case 'document_received':
+        setDocuments((prev) => [...prev, { name: serverEvent.data.name as string, icon: '📄' }]);
+        break;
+      case 'economic_pitch':
+        setEconomicPitch({
+          headline: 'Case Package Complete',
+          summary: serverEvent.data.pitch as string,
+          estimatedRange: `$${((serverEvent.data.damages_low as number) / 1000).toFixed(0)}K – $${((serverEvent.data.damages_high as number) / 1000).toFixed(0)}K`,
+          statutes: [],
+          elements: '',
+          documents: 0,
+          viability: 100,
+        });
+        break;
+      case 'session_start':
+        liveStartTime.current = Date.now();
+        break;
+      case 'session_end':
+        setCallState('complete');
+        break;
+    }
+    // Update elapsed time for live mode
+    if (liveStartTime.current > 0) {
+      setElapsedMs(Date.now() - liveStartTime.current);
+    }
+  }, []);
+
+  /* ── Connect to SSE stream ────────────────────────────────────── */
+  const connectSSE = useCallback(() => {
+    if (sseRef.current) {
+      sseRef.current.close();
+    }
+    const es = new EventSource(`${AGENT_URL}/api/demo/stream`);
+    sseRef.current = es;
+
+    es.onmessage = (event) => {
+      try {
+        const parsed = JSON.parse(event.data);
+        adaptServerEvent(parsed);
+      } catch {
+        // ignore parse errors
+      }
+    };
+
+    es.onerror = () => {
+      // SSE connection failed — fall back to replay
+      console.log('[demo] SSE connection failed, falling back to replay mode');
+      es.close();
+      sseRef.current = null;
+      if (mode === 'live') {
+        setMode('replay');
+      }
+    };
+
+    es.onopen = () => {
+      console.log('[demo] SSE connected to justice-agent');
+      setMode('live');
+    };
+  }, [adaptServerEvent, mode]);
+
+  /* ── Trigger a live demo run via POST ─────────────────────────── */
+  const triggerLiveDemo = useCallback(async () => {
+    // Reset all state
+    setTranscript([]);
+    setElements(() => {
+      const init: Record<string, ElementState> = {};
+      for (const el of ELEMENTS) init[el] = { status: 'pending', reasoning: '' };
+      return init as Record<ElementName, ElementState>;
+    });
+    setStatutes([]);
+    setViability(0);
+    setViabilityTier('Pending');
+    setCallState('idle');
+    setDocuments([]);
+    setEconomicPitch(null);
+    setElapsedMs(0);
+    liveStartTime.current = 0;
+
+    // Connect SSE first
+    connectSSE();
+
+    // Then trigger the processing
+    try {
+      await fetch(`${AGENT_URL}/api/demo/trigger`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      setMode('live');
+      setPlaying(true);
+    } catch (err) {
+      console.error('[demo] Failed to trigger live demo:', err);
+      setMode('replay');
+      setPlaying(true);
+    }
+  }, [connectSSE]);
+
+  /* ── Cleanup SSE on unmount ───────────────────────────────────── */
+  useEffect(() => {
+    return () => {
+      if (sseRef.current) sseRef.current.close();
+    };
   }, []);
 
   /* ── Schedule the next event ────────────────────────────────────── */
@@ -590,6 +732,15 @@ export default function DemoPage() {
           >
             Restart
           </button>
+          <button
+            onClick={triggerLiveDemo}
+            className="text-xs font-bold px-4 py-1.5 rounded-lg bg-red-600 border border-red-500 text-white hover:bg-red-500 transition-colors animate-pulse"
+          >
+            {mode === 'live' ? '● LIVE' : '⚡ Go Live'}
+          </button>
+          {mode === 'live' && (
+            <span className="text-[10px] text-red-400 font-mono">STREAMING</span>
+          )}
         </div>
       </footer>
 

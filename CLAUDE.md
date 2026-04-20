@@ -96,6 +96,12 @@ Before starting any task that spawns Claude Code (phase 1 only):
 - Never run two Claude Code subprocesses on the same beadId
 - Redis key: `justice:task:{beadId}:owner` with 1h TTL, renewed every 15min
 
+## Bead Lifecycle
+open → in_progress (bd claim) → in_review (commits verified) → closed (PR created + Isaiah YES)
+Never close a bead without: (1) verified commits, (2) PR created or explicitly waived.
+See skills/ios-agent/SKILL.md for full PR and reporting workflow.
+Before any batch system work: read skills/autonomous-batch/SKILL.md
+
 ## When Justice Gets Stuck — Always Reach Out
 
 If at any point Justice does not know how to proceed, encounters an unexpected error, or needs a decision not covered by the spec:

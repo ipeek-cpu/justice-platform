@@ -6,8 +6,8 @@
  *
  * 39 tools. See TOOL_DEFINITIONS array.
  * Tools: query_case_metrics, query_case, create_task, list_tasks, complete_task,
- *        draft_email, confirm_send_email, schedule_meeting, check_calendar, get_status_briefing,
- *        justice_status, unstick_task
+ *        draft_email, confirm_send_email, schedule_meeting, schedule_batch, check_calendar,
+ *        get_status_briefing, justice_status, unstick_task
  */
 
 import { getCaseMetrics, getCaseBySessionId, createTask, getTasksByAssignee, completeTask, logAuditEntry } from '../db/queries';
@@ -36,6 +36,19 @@ import { runPhase, waitForApproval, type TaskSession } from './code-executor';
 const execAsync = promisify(exec);
 
 const ISAIAH = process.env.APPROVED_NUMBER_ISAIAH!;
+
+/** Map friendly names → actual email addresses for "send from X" syntax. */
+const EMAIL_ALIASES: Record<string, string> = {
+  work: process.env.ISAIAH_WORK_EMAIL ?? 'Isaiah@wolflaw.ai',
+  wolflaw: 'Isaiah@wolflaw.ai',
+  personal: process.env.ISAIAH_PERSONAL_EMAIL ?? '',
+  ipeekwork: process.env.ISAIAH_PERSONAL_EMAIL ?? '',
+};
+
+function resolveEmailAlias(input: string): string {
+  if (input.includes('@')) return input;
+  return EMAIL_ALIASES[input.toLowerCase()] || input;
+}
 
 export interface ConversationMessage {
   role: 'user' | 'assistant';
@@ -134,7 +147,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'schedule_meeting',
-    description: 'Schedule a meeting or call on Google Calendar.',
+    description: 'Schedule a single meeting or call with attendees on Google Calendar. For multiple events, time blocks, or recurring schedules use schedule_batch instead.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -145,6 +158,32 @@ const TOOL_DEFINITIONS = [
         notes: { type: 'string', description: 'Additional notes' },
       },
       required: ['title', 'attendees'],
+    },
+  },
+  {
+    name: 'schedule_batch',
+    description: 'Create multiple calendar events at once. Use for recurring blocks, weekly schedules, multi-day planning.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        events: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              date: { type: 'string', description: 'Date in YYYY-MM-DD format' },
+              start_time: { type: 'string', description: 'Start time in HH:MM 24h format' },
+              end_time: { type: 'string', description: 'End time in HH:MM 24h format' },
+              notes: { type: 'string' },
+            },
+            required: ['title', 'date', 'start_time', 'end_time'],
+          },
+          description: 'Array of events to create',
+        },
+        timezone: { type: 'string', description: 'IANA timezone (default: America/Chicago)' },
+      },
+      required: ['events'],
     },
   },
   {
@@ -577,11 +616,13 @@ Rules:
 - Default to the primary (@wolflaw.ai) account for creating calendar events and sending email.
 - If the user references a personal context or asks to send from a specific account, use the matching from_account.
 - Do NOT ask which account to use unless the context is ambiguous — infer from the conversation.
+- Email "from" aliases: "work" or "wolflaw" → Isaiah@wolflaw.ai, "personal" or "ipeekwork" → ipeekwork@gmail.com, or pass a full email address.
+- When user says "email from work to ..." set from_account to "work". When they say "email from ipeekwork to ..." set from_account to "ipeekwork".
 
 Nudges: I proactively remind you about upcoming and overdue tasks via iMessage. You can pause, snooze, or check nudge status.
 - Morning brief: I send you a daily briefing at 8 AM with tasks, deadlines, and case updates. You can ask me to send one now, or disable/enable them.
 
-Available actions: query case metrics, look up cases, create/list/complete tasks, draft and send emails, schedule meetings, check calendar, provide status briefings, search/read/create/update Notion pages, configure task nudges, manage morning briefs, draft LinkedIn outreach (logged to Notion, never sent directly), log facts to long-term memory, check beads task status, queue autonomous code execution tasks, manage iOS project registry, generate tailored resumes (single, batch, or generate-and-email — rephrases and reorders resume content to match job descriptions, never fabricates), email resume PDFs as attachments, check task checkout status (see which autonomous tasks are currently claimed), and manage iOS projects (build, clean, status, PR, review, overnight runs, start specific beads).
+Available actions: query case metrics, look up cases, create/list/complete tasks, draft and send emails, schedule meetings, schedule batch events (use schedule_batch for "schedule my week with..." or "create daily blocks for..." — creates multiple calendar events at once), check calendar, provide status briefings, search/read/create/update Notion pages, configure task nudges, manage morning briefs, draft LinkedIn outreach (logged to Notion, never sent directly), log facts to long-term memory, check beads task status, queue autonomous code execution tasks, manage iOS project registry, generate tailored resumes (single, batch, or generate-and-email — rephrases and reorders resume content to match job descriptions, never fabricates), email resume PDFs as attachments, check task checkout status (see which autonomous tasks are currently claimed), and manage iOS projects (build, clean, status, PR, review, overnight runs, start specific beads).
 
 iOS project commands — registered projects: ${listProjects().map(p => p.id).join(', ') || '(none)'}
 - "[project] build" or "build [project]" — build with xcodebuild
@@ -681,11 +722,12 @@ async function executeTool(
     }
 
     case 'draft_email': {
+      const rawFrom = input.from_account as string | undefined;
       const draft = {
         to: input.to as string[],
         subject: input.subject as string,
         body: input.body as string,
-        fromAccount: input.from_account as string | undefined,
+        fromAccount: rawFrom ? resolveEmailAlias(rawFrom) : undefined,
         draftedAt: new Date().toISOString(),
       };
       pendingEmails.set(callerIdentity, draft);
@@ -710,7 +752,8 @@ async function executeTool(
       if (!hasAuth) {
         return JSON.stringify({ status: 'error', error: `Gmail not connected for ${callerIdentity} — visit /api/oauth/google/authorize?user=${callerIdentity}` });
       }
-      const fromAccount = (input.from_account as string) ?? draft.fromAccount;
+      const rawOverride = input.from_account as string | undefined;
+      const fromAccount = rawOverride ? resolveEmailAlias(rawOverride) : draft.fromAccount;
       const sendResult = await sendGmail(callerIdentity, draft.to, draft.subject, draft.body, fromAccount);
       if ('error' in sendResult) return JSON.stringify({ status: 'error', error: sendResult.error });
       return JSON.stringify({ status: 'sent', message_id: sendResult.messageId, sent_from: sendResult.sentFrom, to: draft.to, subject: draft.subject });
@@ -730,8 +773,12 @@ async function executeTool(
       // Parse duration (default 30 min)
       const durationStr = (input.duration as string) ?? '30 min';
       const durationMinutes = parseInt(durationStr) || 30;
-      const startTime = new Date(proposedTime).toISOString();
-      const endTime = new Date(new Date(proposedTime).getTime() + durationMinutes * 60 * 1000).toISOString();
+      const parsed = new Date(proposedTime);
+      if (isNaN(parsed.getTime())) {
+        return JSON.stringify({ status: 'need_time', message: `Could not parse "${proposedTime}". Please use ISO format: YYYY-MM-DDTHH:MM` });
+      }
+      const startTime = parsed.toISOString();
+      const endTime = new Date(parsed.getTime() + durationMinutes * 60 * 1000).toISOString();
 
       const result = await createCalendarEvent(callerIdentity, {
         title: input.title as string,
@@ -742,7 +789,44 @@ async function executeTool(
       });
 
       if ('error' in result) return JSON.stringify({ status: 'error', error: result.error });
-      return JSON.stringify({ status: 'scheduled', event_id: result.id, link: result.link });
+      return JSON.stringify({
+        status: 'scheduled',
+        event_id: result.id,
+        link: result.link,
+        ...(result.meetLink && { meet_link: result.meetLink }),
+      });
+    }
+
+    case 'schedule_batch': {
+      const hasAuth = await hasGoogleAuth(callerIdentity);
+      if (!hasAuth) {
+        return JSON.stringify({ error: `Calendar not connected — visit /api/oauth/google/authorize?user=${callerIdentity}` });
+      }
+
+      const events = input.events as Array<{ title: string; date: string; start_time: string; end_time: string; notes?: string }>;
+      const _tz = (input.timezone as string) || 'America/Chicago'; // reserved for future use; createCalendarEvent hardcodes America/Chicago
+      const results: Array<{ title: string; date: string; status: string; link?: string; meet_link?: string; error?: string }> = [];
+
+      for (const evt of events) {
+        const startTime = `${evt.date}T${evt.start_time}:00`;
+        const endTime = `${evt.date}T${evt.end_time}:00`;
+        const calResult = await createCalendarEvent(callerIdentity, {
+          title: evt.title,
+          attendees: [],
+          startTime,
+          endTime,
+          notes: evt.notes,
+        });
+        if ('error' in calResult) {
+          results.push({ title: evt.title, date: evt.date, status: 'failed', error: calResult.error });
+        } else {
+          results.push({ title: evt.title, date: evt.date, status: 'created', link: calResult.link, ...(calResult.meetLink && { meet_link: calResult.meetLink }) });
+        }
+      }
+
+      const created = results.filter(r => r.status === 'created').length;
+      const failed = results.filter(r => r.status === 'failed').length;
+      return JSON.stringify({ created, failed, total: events.length, details: results });
     }
 
     case 'check_calendar': {
@@ -752,34 +836,38 @@ async function executeTool(
       }
 
       const range = (input.range as string) ?? 'today';
-      const now = new Date();
+      // Compute "today" in Chicago time to avoid UTC date drift
+      const tz = process.env.JUSTICE_TIMEZONE ?? 'America/Chicago';
+      const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+      const todayBase = new Date(todayStr + 'T00:00:00');
+      const DAY = 24 * 60 * 60 * 1000;
       let timeMin: Date;
       let timeMax: Date;
 
       switch (range) {
         case 'tomorrow':
-          timeMin = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-          timeMax = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2);
+          timeMin = new Date(todayBase.getTime() + DAY);
+          timeMax = new Date(todayBase.getTime() + 2 * DAY);
           break;
         case 'this_week': {
-          const dayOfWeek = now.getDay();
-          timeMin = new Date(now.getFullYear(), now.getMonth(), now.getDate() - dayOfWeek);
-          timeMax = new Date(now.getFullYear(), now.getMonth(), now.getDate() + (7 - dayOfWeek));
+          const dayOfWeek = todayBase.getDay();
+          timeMin = new Date(todayBase.getTime() - dayOfWeek * DAY);
+          timeMax = new Date(todayBase.getTime() + (7 - dayOfWeek) * DAY);
           break;
         }
         case 'next_week': {
-          const dow = now.getDay();
-          timeMin = new Date(now.getFullYear(), now.getMonth(), now.getDate() + (7 - dow));
-          timeMax = new Date(now.getFullYear(), now.getMonth(), now.getDate() + (14 - dow));
+          const dayOfWeek = todayBase.getDay();
+          timeMin = new Date(todayBase.getTime() + (7 - dayOfWeek) * DAY);
+          timeMax = new Date(todayBase.getTime() + (14 - dayOfWeek) * DAY);
           break;
         }
         default: // 'today' or specific date
           if (input.date) {
             timeMin = new Date(input.date as string);
-            timeMax = new Date(timeMin.getTime() + 24 * 60 * 60 * 1000);
+            timeMax = new Date(timeMin.getTime() + DAY);
           } else {
-            timeMin = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-            timeMax = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+            timeMin = todayBase;
+            timeMax = new Date(todayBase.getTime() + DAY);
           }
       }
 
@@ -1730,12 +1818,13 @@ export async function handleMessage(
   }
 
   const model = process.env.CLAUDE_MODEL ?? 'claude-sonnet-4-20250514';
-  const TZ = 'America/Chicago';
+  const TZ = process.env.JUSTICE_TIMEZONE ?? 'America/Chicago';
   const now = new Date();
 
   // Today and tomorrow in CT
   const todayISO = now.toLocaleDateString('en-CA', { timeZone: TZ }); // YYYY-MM-DD
   const todayDow = now.toLocaleDateString('en-US', { timeZone: TZ, weekday: 'long' });
+  const currentTime = now.toLocaleTimeString('en-US', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: true });
   const tomorrowDate = new Date(now.getTime() + 86_400_000);
   const tomorrowISO = tomorrowDate.toLocaleDateString('en-CA', { timeZone: TZ });
   const tomorrowDow = tomorrowDate.toLocaleDateString('en-US', { timeZone: TZ, weekday: 'long' });
@@ -1749,11 +1838,13 @@ export async function handleMessage(
   const nextFridayISO = new Date(ctNoon.getTime() + daysToFriday * 86_400_000).toLocaleDateString('en-CA');
 
   const dateContext = [
-    `Current date: ${todayISO}`,
-    `Day of week: ${todayDow}`,
+    `Current date and time: ${todayDow}, ${todayISO} at ${currentTime} (${TZ})`,
     `Tomorrow: ${tomorrowDow}, ${tomorrowISO}`,
     `This coming Monday: ${nextMondayISO}`,
     `This coming Friday: ${nextFridayISO}`,
+    `When someone says "today", "this afternoon", "tonight", or "tomorrow", always calculate relative to the date/time above.`,
+    `Never schedule in the past. If a time today has already passed, ask if they mean tomorrow.`,
+    `Always use ISO format with timezone for proposed_time: e.g. ${todayISO}T19:30:00 for 7:30 PM today.`,
   ].join('\n');
 
   const systemPrompt = await buildSystemPrompt(callerIdentity, dateContext);
@@ -1788,7 +1879,7 @@ export async function handleMessage(
           },
           body: JSON.stringify({
             model,
-            max_tokens: 1024,
+            max_tokens: 4096,
             system: systemPrompt,
             tools: TOOL_DEFINITIONS,
             messages: apiMessages,

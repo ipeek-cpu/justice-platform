@@ -20,6 +20,7 @@ export interface PhaseResult {
   success: boolean;
   output: string;
   duration: string;
+  exitCode: number;
 }
 
 export interface TaskSession {
@@ -36,6 +37,8 @@ export interface RunPhaseOptions {
   skipClaim?: boolean;
   /** Skip cleanupTask at end — caller will handle cleanup. */
   skipCleanup?: boolean;
+  /** Suppress per-phase iMessage + approval stamp (overnight/batch mode). */
+  silent?: boolean;
 }
 
 /**
@@ -55,7 +58,7 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
           `Task ${session.beadId} is already running in another session. Skipping.`
         );
       }
-      return { phaseId: phase.id, success: false, output: 'Already claimed', duration: '0m' };
+      return { phaseId: phase.id, success: false, output: 'Already claimed', duration: '0m', exitCode: 1 };
     }
   }
 
@@ -88,18 +91,21 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
       renewClaim(session.beadId, session.sessionId).catch(console.error);
     }, 15 * 60 * 1000);
 
-    // Kill subprocess if no output received for 45 minutes (stale process)
+    // Dynamic stale timeout: 120min for review (phase 99), 90min for normal phases
+    const staleTimeoutMs = phase.number === 99 ? 120 * 60 * 1000 : 90 * 60 * 1000;
+
+    // Kill subprocess if no output received for staleTimeoutMs (stale process)
     let staleTimer = setTimeout(() => {
       child.kill('SIGTERM');
       executionLogger.log({ event: 'subprocess_timeout', beadId: session.beadId, pid: child.pid, phase: phase.number, level: 'warn' });
-    }, 45 * 60 * 1000);
+    }, staleTimeoutMs);
 
     const resetStaleTimer = () => {
       clearTimeout(staleTimer);
       staleTimer = setTimeout(() => {
         child.kill('SIGTERM');
         executionLogger.log({ event: 'subprocess_timeout', beadId: session.beadId, pid: child.pid, phase: phase.number, level: 'warn' });
-      }, 45 * 60 * 1000);
+      }, staleTimeoutMs);
     };
 
     // Flush partial output to Notion every 15 seconds
@@ -109,6 +115,24 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
         await notionLogger.logPhaseComplete(session.notionPageId, phase, `[in progress]\n${partial}`, -1);
       }
     }, 15_000);
+
+    // Progress heartbeat: Notion every 10min, iMessage every 30min (skip in silent mode)
+    const heartbeatInterval = setInterval(async () => {
+      const elapsed = Math.round((Date.now() - start) / 60000);
+      const lines = chunks.join('').split('\n').length;
+      await notionLogger.logTimelineEvent(
+        session.notionPageId, 'running',
+        `Phase ${phase.number} running — ${elapsed}min, ${lines} output lines`
+      ).catch(() => {});
+      if (!opts?.silent && elapsed > 0 && elapsed % 30 === 0) {
+        const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
+        if (approvedNumber) {
+          await sendIMessage(approvedNumber,
+            `${session.taskName} still working (${elapsed}min). Not stuck.`
+          ).catch(() => {});
+        }
+      }
+    }, 10 * 60 * 1000);
 
     child.stdout?.on('data', (data: Buffer) => {
       chunks.push(data.toString());
@@ -124,24 +148,39 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
       clearInterval(flushInterval);
       clearInterval(renewInterval);
       clearTimeout(staleTimer);
+      clearInterval(heartbeatInterval);
       const exitCode = code ?? 1;
       const output = chunks.join('');
       const durationMs = Date.now() - start;
       const duration = `${(durationMs / 1000).toFixed(1)}s`;
 
+      // Exit 143 = SIGTERM (killed by timeout). Check for partial work.
+      if (exitCode === 143) {
+        const elapsed = `${(durationMs / 60000).toFixed(1)}m`;
+        const partialSuccess = output.length > 500;
+        await notionLogger.logPhaseComplete(session.notionPageId, phase, output, exitCode);
+        executionLogger.log({ event: 'phase_complete', beadId: session.beadId, sessionId: session.sessionId, phase: phase.number, success: partialSuccess, durationMs, exitCode: 143 });
+        await notionLogger.logTimelineEvent(session.notionPageId, partialSuccess ? 'success' : 'failed', `Phase ${phase.number} SIGTERM after ${elapsed} (partial: ${partialSuccess})`);
+        if (!opts?.skipCleanup) await cleanupTask(session.beadId, session.sessionId);
+        resolve({ phaseId: phase.id, success: partialSuccess, output, duration: elapsed, exitCode: 143 });
+        return;
+      }
+
       await notionLogger.logPhaseComplete(session.notionPageId, phase, output, exitCode);
       executionLogger.log({ event: 'phase_complete', beadId: session.beadId, sessionId: session.sessionId, phase: phase.number, success: exitCode === 0, durationMs });
       await notionLogger.logTimelineEvent(session.notionPageId, exitCode === 0 ? 'success' : 'failed', `Phase ${phase.number} ${exitCode === 0 ? 'complete' : 'failed'} (${duration})`);
 
-      const statusEmoji = exitCode === 0 ? 'Done' : 'Failed';
-      const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
-      if (approvedNumber) {
-        const stamp = await createApproval(session.sessionId, `Phase ${phase.number} ${statusEmoji}: ${phase.name}`);
-        await sendIMessage(
-          approvedNumber,
-          `Phase ${phase.number} ${statusEmoji}: ${phase.name} (${duration}) ${formatStamp(stamp)}\nNotion: ${notionLogger.pageUrl(session.notionPageId)}\nReply "yes ${stamp}" to continue or "no ${stamp}" to stop.`
-        );
-        await notionLogger.logTimelineEvent(session.notionPageId, 'waiting', `Waiting for approval ${formatStamp(stamp)}`);
+      if (!opts?.silent) {
+        const statusEmoji = exitCode === 0 ? 'Done' : 'Failed';
+        const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
+        if (approvedNumber) {
+          const stamp = await createApproval(session.sessionId, `Phase ${phase.number} ${statusEmoji}: ${phase.name}`);
+          await sendIMessage(
+            approvedNumber,
+            `Phase ${phase.number} ${statusEmoji}: ${phase.name} (${duration}) ${formatStamp(stamp)}\nNotion: ${notionLogger.pageUrl(session.notionPageId)}\nReply "yes ${stamp}" to continue or "no ${stamp}" to stop.`
+          );
+          await notionLogger.logTimelineEvent(session.notionPageId, 'waiting', `Waiting for approval ${formatStamp(stamp)}`);
+        }
       }
 
       if (!opts?.skipCleanup) {
@@ -153,6 +192,7 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
         success: exitCode === 0,
         output,
         duration,
+        exitCode,
       });
     });
   });
@@ -161,12 +201,12 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
 /**
  * Wait for Isaiah's approval via Redis polling.
  * Creates a stamped approval, pings Isaiah, then polls every 5s.
- * Resolves true (YES) or false (NO). Rejects on timeout (default 24h).
+ * Never throws — re-pings every 6 hours until resolved.
  */
 export async function waitForApproval(
   session: TaskSession,
   question: string,
-  timeoutMs = 24 * 60 * 60 * 1000
+  options?: { onReping?: () => Promise<void> },
 ): Promise<boolean> {
   const stamp = await createApproval(session.sessionId, question);
   await notionLogger.logQuestion(session.notionPageId, `${formatStamp(stamp)} ${question}`);
@@ -176,36 +216,39 @@ export async function waitForApproval(
     await sendIMessage(approvedNumber, `Justice needs approval: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`);
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    let lastPing = Date.now();
+    const REPING_MS = 6 * 60 * 60 * 1000;
+
     const poll = setInterval(async () => {
       try {
         const approval = await getApproval(stamp);
         if (!approval) {
           clearInterval(poll);
-          clearTimeout(timeout);
           resolve(false);
           return;
         }
         if (approval.status === 'YES') {
           clearInterval(poll);
-          clearTimeout(timeout);
           executionLogger.log({ event: 'approval_received', beadId: session.beadId, sessionId: session.sessionId, approved: true });
           resolve(true);
         } else if (approval.status === 'NO') {
           clearInterval(poll);
-          clearTimeout(timeout);
           executionLogger.log({ event: 'approval_received', beadId: session.beadId, sessionId: session.sessionId, approved: false });
           resolve(false);
+        } else if (Date.now() - lastPing > REPING_MS) {
+          if (approvedNumber) {
+            await sendIMessage(approvedNumber,
+              `Reminder: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`
+            );
+          }
+          lastPing = Date.now();
+          if (options?.onReping) {
+            await options.onReping().catch(() => {});
+          }
         }
-      } catch {
-        // Redis read error — keep polling
-      }
+      } catch { /* Redis error — keep polling */ }
     }, 5000);
-
-    const timeout = setTimeout(() => {
-      clearInterval(poll);
-      reject(new Error(`Approval timeout after ${timeoutMs}ms for ${formatStamp(stamp)}`));
-    }, timeoutMs);
   });
 }
 

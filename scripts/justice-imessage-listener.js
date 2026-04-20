@@ -63,23 +63,31 @@ function extractTextFromAttributedBodyHex(hex) {
     }
   }
   if (!afterMarker) return null;
-  // Next byte(s) encode the string length, then text follows until 8684 terminator
-  // Read first byte as length indicator
+  // Typedstream integer encoding for string length:
+  //   < 0x80: direct 1-byte value (0–127)
+  //   0x81:   next 2 bytes = uint16 little-endian
+  //   0x82:   next 4 bytes = uint32 little-endian
   const lenByte = parseInt(afterMarker.substring(0, 2), 16);
-  let textHex;
+  let strLen, offset;
   if (lenByte < 0x80) {
-    // Simple 1-byte length
-    textHex = afterMarker.substring(2, 2 + lenByte * 2);
+    strLen = lenByte;
+    offset = 2; // 1 byte = 2 hex chars
+  } else if (lenByte === 0x81) {
+    const lo = parseInt(afterMarker.substring(2, 4), 16);
+    const hi = parseInt(afterMarker.substring(4, 6), 16);
+    strLen = (hi << 8) | lo;
+    offset = 6; // 3 bytes = 6 hex chars
+  } else if (lenByte === 0x82) {
+    const b0 = parseInt(afterMarker.substring(2, 4), 16);
+    const b1 = parseInt(afterMarker.substring(4, 6), 16);
+    const b2 = parseInt(afterMarker.substring(6, 8), 16);
+    const b3 = parseInt(afterMarker.substring(8, 10), 16);
+    strLen = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+    offset = 10; // 5 bytes = 10 hex chars
   } else {
-    // Multi-byte length: lenByte & 0x7F = number of following length bytes
-    const numLenBytes = lenByte & 0x7F;
-    let strLen = 0;
-    for (let i = 0; i < numLenBytes; i++) {
-      strLen = (strLen << 8) | parseInt(afterMarker.substring(2 + i * 2, 4 + i * 2), 16);
-    }
-    const offset = 2 + numLenBytes * 2;
-    textHex = afterMarker.substring(offset, offset + strLen * 2);
+    return null;
   }
+  const textHex = afterMarker.substring(offset, offset + strLen * 2);
   try {
     return Buffer.from(textHex, 'hex').toString('utf8');
   } catch {

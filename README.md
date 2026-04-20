@@ -1,6 +1,6 @@
-# Justice — Autonomous AI Agent Platform
+# Justice — The Core IP of Wronged.ai
 
-> Autonomous AI agent for iOS development automation, executive assistance, and Wolf Law employment triage.
+> Autonomous AI agent powering the **Wronged.ai** legal marketplace. Justice triages callers for subscribing law firms, routes scored case packages to the best-fit attorney across the network, assists executive operations, and drives end-to-end iOS build automation.
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue)
 ![Node](https://img.shields.io/badge/Node-20%2B-green)
@@ -9,51 +9,109 @@
 
 ---
 
-## What Justice Does
+## Platform Context: Wronged.ai
 
-### 1. iOS Build Automation
+**Wronged.ai** is the SaaS platform. Subscribing law firms (Wolf Law today, future tenants tomorrow) are customers. **Justice** is the agent. Callers never see Wronged.ai or Justice — they experience only the subscribing law firm's brand.
 
-Isaiah texts a command like `hlstc batch m3-sessions` and Justice autonomously:
-- Resolves all open beads for that phase (topological sort by dependencies)
-- Creates a git worktree for branch isolation
-- Runs each bead through a Claude Code subprocess
-- Commits changes per-bead, pushes to origin
-- Runs a final build check (xcodebuild) on the worktree
-- Auto-fixes build errors (1 cycle)
-- Runs a code review agent on the full diff
-- Auto-remediates review concerns (up to 2 fix cycles)
-- Sends one iMessage summary with approval stamp
-- On approval: creates a draft PR, closes all beads
+The moat is the routing intelligence: a caller dials a tenant law firm's number, Justice triages, scores, and packages the case, then routes it to the best-fit attorney across the **entire network** — regardless of which tenant took the call.
 
-### 2. Executive Assistant
+```
+    Caller                   Tenant Firm                    Wronged.ai Network
+  ┌────────┐   dials     ┌────────────────┐   routed    ┌──────────────────────┐
+  │ Caller │ ──────────▶ │  Wolf Law #    │ ─────────▶  │  Best-fit attorney   │
+  │        │             │  (branded IVR) │  case pkg   │  anywhere in network │
+  └────────┘             └────────────────┘             └──────────────────────┘
+                                  ▲                                  │
+                                  │    Justice scoring + routing     │
+                                  └──────────────────────────────────┘
+```
 
-Responds to iMessage from approved numbers (Isaiah, Scott):
+---
+
+## Justice's Three Roles
+
+### 1. Voice Agent (Caller-Facing, Per-Tenant Branded)
+Handles inbound calls to a subscribing law firm:
+- Intake via **Twilio + ElevenLabs** conversational voice
+- Statute matching against the knowledge base
+- **Six-element case scoring** (WS7 case package engine)
+- Case package generation with educational disclaimers
+- Cross-network attorney routing via the marketplace engine
+- Zero mention of Wronged.ai or Justice in caller-facing content
+
+### 2. Executive Assistant (Isaiah + Scott Only)
+Responds to iMessage from approved numbers only:
 - Calendar management (Google Calendar)
-- Email drafting and sending (Gmail)
+- Email drafting and sending (Gmail, never auto-sends)
 - Task creation and tracking (beads)
 - Notion workspace search, read, create, update
 - Status briefings, morning briefs, proactive nudges
+- Resume tailoring + LinkedIn outreach drafting
 
-### 3. Wolf Law Employment Triage
+### 3. iOS Build Automation
+Isaiah texts `hlstc batch m3-sessions` and Justice autonomously:
+- Resolves all open beads for that phase (topological sort by dependencies)
+- Creates an isolated git worktree for the branch
+- Runs each bead through a Claude Code subprocess
+- Commits per-bead, pushes to origin
+- Runs a final `xcodebuild` check on the worktree
+- Auto-fixes build errors (1 cycle)
+- Runs a review agent on the full diff, auto-remediates (up to 2 fix cycles)
+- Sends **one** iMessage summary with approval stamp
+- On `yes`: creates a draft PR, closes all beads
 
-Voice agent for law firm callers (branded as the subscribing firm):
-- Intake via Twilio + ElevenLabs voice
-- Statute matching and case scoring
-- Case package generation
-- Attorney routing across the network
-- Multi-tenant: each law firm is an isolated tenant
+---
+
+## Multi-Tenancy Model
+
+Each law firm is an isolated tenant with its own phone number, branding, and voice-agent configuration. Tenant registry lives at:
+
+```
+packages/justice-agent/src/multi-tenancy/tenant-registry.ts
+```
+
+Onboarding a new tenant = one registry entry + one Twilio phone number. All tenants share the same scoring engine, knowledge base, and case-law API. **Case routing is cross-tenant** — the marketplace routes to the best attorney regardless of which firm took the call.
+
+---
+
+## Hard Compliance Boundaries
+
+1. No legal conclusions about any caller's specific situation
+2. No caller PII outside Tier 3 encrypted storage
+3. All statute outputs include educational disclaimers — always
+4. MSA fees never tied to legal outcomes or revenues
+5. Wronged.ai and Justice names never appear in caller-facing content
+6. Justice does not render legal judgment — attorneys do
+7. Executive mode (Mode 2) restricted to approved numbers only
+8. Agency filing options gated by statute applicability — never surface irrelevant agencies
+
+## Data Classification
+
+| Tier | Classification | Examples | Storage |
+|------|---------------|----------|---------|
+| 1 | Public | Statute text, case-law citations, educational content, aggregate metrics | Anywhere |
+| 2 | Internal | Case scores, statute matches, W2 ranges (never exact), routing logs | Internal DB |
+| 3 | Confidential | Caller PII, transcripts, uploaded docs | **Encrypted Postgres only** |
+| 4 | Privileged | Attorney-client communications | **Justice never touches this** |
+
+## Case-Law Integration
+
+- **Phase 1 (now)**: Casetext API — `queryCaseLaw(statute, keywords, jurisdiction)`
+- **Phase 2 (post-incorporation)**: Westlaw API — same interface, swapped implementation
+- **Fallback**: Hardcoded landmark cases per statute category (real citations only)
+- Justice **never** hallucinates case citations
 
 ---
 
 ## Architecture
 
 ```
-justice-platform/
+justice-repo/
 ├── apps/
 │   ├── justice-agent/              # Core agent — port 3002
 │   │   └── src/
 │   │       ├── modes/
-│   │       │   ├── conversational-engine.ts   # 42 tools, Claude tool_use loop
+│   │       │   ├── conversational-engine.ts   # Claude tool_use loop (42 tools)
 │   │       │   ├── batch-runner.ts            # Autonomous batch execution
 │   │       │   ├── code-executor.ts           # Claude Code subprocess mgmt
 │   │       │   ├── review-agent.ts            # Code review + auto-remediation
@@ -65,20 +123,25 @@ justice-platform/
 │   │       │   ├── approval-gate.ts           # Stamped approval system
 │   │       │   ├── shell-exec.ts              # Whitelisted shell execution
 │   │       │   ├── github.ts                  # Git worktrees, PRs, branches
-│   │       │   └── migration-coordinator.ts   # Atomic migration numbers
+│   │       │   ├── migration-coordinator.ts   # Atomic migration numbers
+│   │       │   └── google-workspace.ts        # Calendar + Gmail
+│   │       ├── multi-tenancy/                 # Tenant registry + brand config
+│   │       ├── access-control/                # Approved-number gate
+│   │       ├── cron/                          # proactive-agent, schedule
+│   │       ├── nudge/                         # Proactive reminders
 │   │       └── registry/
 │   │           ├── ios-projects.ts            # iOSProject type + registry API
 │   │           └── project-registry.ts        # Env-driven project loader
 │   ├── attorney-portal/            # Attorney subscription portal — port 3000
-│   └── demo-portal/               # Wolf Law demo portal — port 3001
+│   └── demo-portal/                # Wolf Law demo dashboard — port 3001
 ├── packages/
 │   ├── shared-types/               # BatchState, iOSProject, TaskSession
 │   ├── messaging/                  # iMessage + SMS sending
-│   ├── scoring-engine/             # Case scoring algorithms
+│   ├── scoring-engine/             # Six-element case scoring (WS7)
 │   ├── knowledge-base/             # Statute text + case law
-│   └── case-packages/             # Case package generation
-├── skills/                         # SKILL.md files for Claude Code context
-├── scripts/                        # Setup + utilities
+│   └── case-packages/              # Case package generation
+├── skills/                         # SKILL.md context files for Claude Code
+├── scripts/                        # justice-setup.sh, iMessage listener
 └── CLAUDE.md                       # Agent architecture and rules
 ```
 
@@ -167,15 +230,62 @@ The conversational engine exposes 42 tools via Claude `tool_use`:
 
 ---
 
+## Approval Gate + Beads Lifecycle
+
+### Approval Stamps
+Every action with irreversible consequences requires an explicit human `yes` from Isaiah. Stamps:
+- Never expire — `waitForApproval` loops with 6-hour re-pings
+- Support multi-stamp parsing: `yes A1B yes C2D no E3F` resolves all three
+- Bare `yes`/`no` targets the most recent pending approval
+
+**Required approvals:**
+- `git push`
+- `npm`/Swift package install
+- File deletion
+- Phase boundary (log to Notion → iMessage → wait for YES/NO)
+
+### Beads (`bd`) for All Task Tracking
+Never markdown TODO files. Lifecycle:
+```
+open → in_progress (bd claim) → in_review (commits verified) → closed (PR created + approved)
+```
+A bead never closes without verified commits **and** a PR (or an explicit waiver).
+
+### Atomic Task Checkout
+Before spawning a Claude Code subprocess:
+```
+atomicClaim(beadId, sessionId)  # Redis key with 1h TTL, renewed every 15min
+```
+Returns false if the bead is already claimed — Justice pings Isaiah and stops. Never two subprocesses on the same bead.
+
+---
+
+## Session Memory
+
+Local, never committed:
+
+| File | Purpose |
+|------|---------|
+| `memory/MEMORY.md` | Curated long-term facts, never auto-deleted |
+| `memory/YYYY-MM-DD.md` | Daily session log (archive after 90 days) |
+| `memory/execution-log.jsonl` | Append-only event log for every bead action |
+
+**At session start**: `bd ready` → `bd list --label pattern` → `readLongTermMemory()` → last 3 session logs.
+**At session end**: `writeSessionLog()`, `appendToMemory()` on significant patterns, `git push`.
+
+See the Observability skill for detailed event-logging rules.
+
+---
+
 ## Key Design Decisions
 
 - **Claude Code subprocess auth**: Uses local subscription auth. `ANTHROPIC_API_KEY` is stripped from subprocess env to prevent double-billing.
 - **Git worktrees**: Each batch runs in an isolated worktree. Main clone is never checked out to the batch branch.
-- **Redis atomics**: Task checkout (`atomicClaim`), migration numbers (`claimNextMigrationNumber`), approval stamps, batch state — all Redis-backed.
-- **Doppler-driven config**: All project config (paths, repos, phases, Notion IDs) lives in Doppler env vars. Zero hardcoded project data in source.
-- **Single build check**: Build runs once after all beads complete (not per-bead). Runs in the worktree where the branch is checked out.
-- **Approval stamps**: Never expire. `waitForApproval` loops with 6-hour re-pings until Isaiah responds.
+- **Redis atomics**: Task checkout, migration numbers, approval stamps, batch state, build locks — all Redis-backed.
+- **Doppler-driven config**: All project config (paths, repos, phases, Notion IDs) lives in Doppler. Zero hardcoded project data in source.
+- **Single build check**: Build runs once after all beads complete, in the worktree where the branch is checked out.
 - **Auto-remediation**: Review agent creates fix beads automatically. Up to 2 fix cycles before escalating to Isaiah.
+- **Stuck detection**: 30-minute no-event threshold triggers proactive alert on the 8am cron.
 
 ---
 
@@ -226,14 +336,13 @@ The conversational engine exposes 42 tools via Claude `tool_use`:
 ## Installation
 
 ```bash
-# Clone and run setup
 gh repo clone ipeek-cpu/justice-platform ~/Developer/justice-repo
 cd ~/Developer/justice-repo
 bash scripts/justice-setup.sh
 
 # Or with options
 bash scripts/justice-setup.sh --dry-run              # Preview actions
-bash scripts/justice-setup.sh --user anothermac       # Different username
+bash scripts/justice-setup.sh --user anothermac      # Different username
 ```
 
 The setup script is idempotent — safe to run multiple times.
@@ -247,7 +356,10 @@ cd apps/justice-agent && doppler run -- pnpm dev
 # Terminal 2 — Demo portal (port 3001)
 pnpm dev:demo-portal
 
-# Terminal 3 — Cloudflare tunnel (routes api.wronged.ai → localhost:3002)
+# Terminal 3 — Attorney portal (port 3000)
+pnpm dev:attorney-portal
+
+# Terminal 4 — Cloudflare tunnel (routes api.wronged.ai → localhost:3002)
 cloudflared tunnel run wronged-pilot
 ```
 
@@ -255,7 +367,7 @@ cloudflared tunnel run wronged-pilot
 
 All secrets are managed in **Doppler** (project: `justice`, config: `production`).
 
-See `.env.example` for the full list of required variables. Key groups:
+See `.env.example` for the full list. Key groups:
 
 | Group | Examples |
 |-------|---------|
@@ -271,7 +383,7 @@ See `.env.example` for the full list of required variables. Key groups:
 
 ## Skills System
 
-Claude Code reads `SKILL.md` files for context before executing autonomous tasks. 13 skills:
+Claude Code reads `SKILL.md` files for context before executing autonomous tasks:
 
 | Skill | Purpose |
 |-------|---------|
@@ -280,13 +392,34 @@ Claude Code reads `SKILL.md` files for context before executing autonomous tasks
 | `ios-development` | Swift/SwiftUI coding patterns |
 | `code-execution` | Claude Code subprocess management |
 | `atomic-checkout` | Redis-backed task locking |
-| `beads-workflow` | Bead lifecycle and bd CLI usage |
+| `beads-workflow` | Bead lifecycle and `bd` CLI usage |
 | `notion-logger` | Structured Notion logging |
 | `pattern-library` | Learned patterns from past executions |
 | `shell-exec` | Whitelisted shell command execution |
 | `linkedin-outreach` | LinkedIn message drafting |
 | `resume-engine` | Resume tailoring and generation |
 | `observability` | Execution logging and monitoring |
+
+---
+
+## When Justice Gets Stuck
+
+If Justice encounters an unexpected error, ambiguous decision, or situation not covered by spec, the rule is:
+
+1. **STOP** — do not guess, do not proceed
+2. Log the blocker to the active Notion task page with full context
+3. iMessage Isaiah with a one-line summary + Notion link
+4. Wait for reply
+
+Always reach out for:
+- Unexpected file/repo structure that doesn't match spec
+- Missing or expired credentials
+- Build or test failure that wasn't anticipated
+- Git conflicts that can't be auto-resolved
+- Any decision with irreversible consequences (deletion, overwrite, destructive migration)
+- Anything affecting production data
+
+When in doubt: **stop, log, text, wait.**
 
 ---
 

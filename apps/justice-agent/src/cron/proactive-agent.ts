@@ -3,6 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
+import { executionLogger } from '../integrations/execution-logger';
 
 const execAsync = promisify(exec);
 const ISAIAH = process.env.APPROVED_NUMBER_ISAIAH!;
@@ -51,6 +52,23 @@ export async function runProactiveChecks(): Promise<void> {
   const lastOutreach = await getLastLinkedInOutreachDate();
   if (lastOutreach && daysSince(lastOutreach) >= 14) {
     alerts.push(`No recruiter outreach in ${daysSince(lastOutreach)} days. Want me to draft a new batch?`);
+  }
+
+  // Check 5: Stuck task detection (no log event for 30+ min)
+  const activeTasks = executionLogger.getActiveTasks();
+  for (const task of activeTasks) {
+    const lastEvent = executionLogger.getLastEventForBead(task.beadId!);
+    if (!lastEvent?.ts) continue;
+    const minutesSinceLastEvent = Math.round(
+      (Date.now() - new Date(lastEvent.ts).getTime()) / 60000
+    );
+    if (minutesSinceLastEvent >= 30) {
+      alerts.push(
+        `Task ${task.beadId} (${task.project}) may be stuck — ` +
+        `last event ${minutesSinceLastEvent} min ago (${lastEvent.event}). ` +
+        `Reply "unstick ${task.beadId}" to kill and reopen.`
+      );
+    }
   }
 
   // Send consolidated alert if any conditions met

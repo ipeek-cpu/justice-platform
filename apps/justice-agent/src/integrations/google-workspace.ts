@@ -176,6 +176,7 @@ export async function getCalendarEvents(
           calendarId: 'primary',
           timeMin,
           timeMax,
+          timeZone: 'America/Chicago',
           singleEvents: true,
           orderBy: 'startTime',
           maxResults: 20,
@@ -211,25 +212,41 @@ export async function getCalendarEvents(
 export async function createCalendarEvent(
   callerIdentity: string,
   event: { title: string; attendees: string[]; startTime: string; endTime: string; notes?: string }
-): Promise<{ id: string; link: string } | { error: string }> {
+): Promise<{ id: string; link: string; meetLink?: string } | { error: string }> {
   try {
     const auth = await getAuthedClient(callerIdentity);
     const calendar = google.calendar({ version: 'v3', auth });
 
+    const hasAttendees = event.attendees.length > 0;
+
     const response = await calendar.events.insert({
       calendarId: 'primary',
+      conferenceDataVersion: hasAttendees ? 1 : undefined,
+      sendUpdates: hasAttendees ? 'all' : 'none',
       requestBody: {
         summary: event.title,
         description: event.notes,
-        start: { dateTime: event.startTime },
-        end: { dateTime: event.endTime },
+        start: { dateTime: event.startTime, timeZone: 'America/Chicago' },
+        end: { dateTime: event.endTime, timeZone: 'America/Chicago' },
         attendees: event.attendees.map(email => ({ email })),
+        ...(hasAttendees && {
+          conferenceData: {
+            createRequest: {
+              requestId: `justice-meet-${Date.now()}`,
+              conferenceSolutionKey: { type: 'hangoutsMeet' },
+            },
+          },
+        }),
       },
     });
+
+    const meetLink = response.data.conferenceData?.entryPoints
+      ?.find(ep => ep.entryPointType === 'video')?.uri;
 
     return {
       id: response.data.id ?? '',
       link: response.data.htmlLink ?? '',
+      ...(meetLink && { meetLink }),
     };
   } catch (error) {
     return { error: error instanceof Error ? error.message : 'Calendar event creation failed' };

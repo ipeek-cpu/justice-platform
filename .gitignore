@@ -10,5 +10,14 @@ dist/
 .dolt/
 *.db
 resume-outputs/
-memory/state.json
-memory/*.md
+
+# Session memory (local only — see CLAUDE.md session memory section)
+memory/
+
+# Audit / phase retrospective docs (transient, not repo history)
+AUDIT.md
+*-AUDIT.md
+
+# macOS cruft
+.DS_Store
+**/.DS_Store

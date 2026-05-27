@@ -10,7 +10,7 @@
  *        get_status_briefing, justice_status, unstick_task
  */
 
-import { getCaseMetrics, getCaseBySessionId, createTask, getTasksByAssignee, completeTask, logAuditEntry } from '../db/queries';
+import { getCaseMetrics, getCaseBySessionId, createTask, getTasksByAssignee, completeTask, completeTaskByTitle, logAuditEntry } from '../db/queries';
 import { searchNotion, readNotionPage, createNotionPage, appendToNotionPage, queryNotionDatabase } from '../integrations/notion-client';
 import { getCalendarEvents, createCalendarEvent, sendGmail, sendGmailWithAttachment, hasGoogleAuth, getConnectedAccounts } from '../integrations/google-workspace';
 import { configureNudge, getNudgeState } from '../nudge/task-nudger';
@@ -117,6 +117,26 @@ const TOOL_DEFINITIONS = [
       type: 'object' as const,
       properties: { task_id: { type: 'string', description: 'Task ID or short ID (first 8 chars)' } },
       required: ['task_id'],
+    },
+  },
+  {
+    name: 'complete_task_by_title',
+    description:
+      'Mark a pending task as completed by fuzzy-matching the title. Use this when the user says they finished/read/completed something by name (e.g. "done with X", "I read X") instead of an ID. Defaults to the caller as assignee. If multiple pending tasks match, returns the candidate list so you can ask the user which one.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        title_fragment: {
+          type: 'string',
+          description:
+            'A distinctive substring of the task title (e.g. "Psalms 23" or "demo deck"). Case-insensitive.',
+        },
+        assignee: {
+          type: 'string',
+          description: 'Optional assignee filter — defaults to the caller.',
+        },
+      },
+      required: ['title_fragment'],
     },
   },
   {
@@ -622,6 +642,14 @@ Rules:
 Nudges: I proactively remind you about upcoming and overdue tasks via iMessage. You can pause, snooze, or check nudge status.
 - Morning brief: I send you a daily briefing at 8 AM with tasks, deadlines, and case updates. You can ask me to send one now, or disable/enable them.
 
+Task-completion intents (CRITICAL — do not ignore):
+- Treat short replies like "Done", "Done with X", "I read/finished/completed X", "X is done", "knocked out X", "took care of X" as a request to mark a task complete.
+- For a named task ("I read Psalms 23 and Hebrews"), call complete_task_by_title with a distinctive fragment of the title (e.g. "Psalms 23"). Do NOT call list_tasks first.
+- For a bare "Done" with no name, only act if a single task was discussed in recent turns; otherwise ask "Which task?".
+- If complete_task_by_title returns status="ambiguous", ask the user which one (show titles + short IDs).
+- If status="not_found", tell the user it's already completed (or doesn't exist) — don't pretend you did it.
+- Always confirm completion back briefly: "Marked '<title>' done."
+
 Available actions: query case metrics, look up cases, create/list/complete tasks, draft and send emails, schedule meetings, schedule batch events (use schedule_batch for "schedule my week with..." or "create daily blocks for..." — creates multiple calendar events at once), check calendar, provide status briefings, search/read/create/update Notion pages, configure task nudges, manage morning briefs, draft LinkedIn outreach (logged to Notion, never sent directly), log facts to long-term memory, check beads task status, queue autonomous code execution tasks, manage iOS project registry, generate tailored resumes (single, batch, or generate-and-email — rephrases and reorders resume content to match job descriptions, never fabricates), email resume PDFs as attachments, check task checkout status (see which autonomous tasks are currently claimed), and manage iOS projects (build, clean, status, PR, review, overnight runs, start specific beads).
 
 iOS project commands — registered projects: ${listProjects().map(p => p.id).join(', ') || '(none)'}
@@ -719,6 +747,34 @@ async function executeTool(
       const updated = await completeTask(taskId);
       if (!updated) return JSON.stringify({ error: `Task ${taskId} not found` });
       return JSON.stringify({ success: true, task_id: updated.id.slice(0, 8), title: updated.title });
+    }
+
+    case 'complete_task_by_title': {
+      const fragment = (input.title_fragment as string) ?? '';
+      const assignee = (input.assignee as string) ?? callerIdentity;
+      const result = await completeTaskByTitle(fragment, assignee);
+      if (!result) {
+        return JSON.stringify({
+          status: 'not_found',
+          message: `No pending task for ${assignee} matches "${fragment}". It may already be completed.`,
+        });
+      }
+      if ('matches' in result) {
+        return JSON.stringify({
+          status: 'ambiguous',
+          message: 'Multiple pending tasks match — ask the user which one.',
+          matches: result.matches.map(m => ({
+            id: m.id.slice(0, 8),
+            title: m.title,
+            deadline: m.deadline?.toISOString() ?? null,
+          })),
+        });
+      }
+      return JSON.stringify({
+        status: 'completed',
+        task_id: result.row.id.slice(0, 8),
+        title: result.row.title,
+      });
     }
 
     case 'draft_email': {

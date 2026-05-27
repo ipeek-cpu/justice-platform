@@ -96,6 +96,52 @@ export async function completeTask(taskId: string) {
   return row ?? null;
 }
 
+// Complete a pending task by fuzzy title match (used for natural-language
+// completion intents like "I read X" / "done with Y"). Returns the updated
+// row, or { matches } if multiple pending tasks match and we need
+// disambiguation. Null means no match.
+export async function completeTaskByTitle(
+  titleFragment: string,
+  assignee?: string,
+): Promise<
+  | { row: typeof tasks.$inferSelect }
+  | { matches: Array<{ id: string; title: string; deadline: Date | null }> }
+  | null
+> {
+  const fragment = titleFragment.trim();
+  if (!fragment) return null;
+
+  const conditions = [
+    eq(tasks.status, 'pending'),
+    sql`LOWER(${tasks.title}) LIKE ${'%' + fragment.toLowerCase() + '%'}`,
+  ];
+  if (assignee) conditions.push(eq(tasks.assignee, assignee));
+
+  const candidates = await db
+    .select()
+    .from(tasks)
+    .where(and(...conditions))
+    .orderBy(sql`${tasks.createdAt} DESC`);
+
+  if (candidates.length === 0) return null;
+  if (candidates.length > 1) {
+    return {
+      matches: candidates.slice(0, 5).map(c => ({
+        id: c.id,
+        title: c.title,
+        deadline: c.deadline,
+      })),
+    };
+  }
+
+  const [row] = await db
+    .update(tasks)
+    .set({ status: 'completed', completedAt: new Date() })
+    .where(eq(tasks.id, candidates[0].id))
+    .returning();
+  return row ? { row } : null;
+}
+
 // --- OAuth Tokens ---
 
 export async function upsertOAuthToken(data: {

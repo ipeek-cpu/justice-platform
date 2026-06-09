@@ -32,7 +32,7 @@ export async function sendSMS(
       return { success: false, error: `Twilio error: ${response.status} ${errorData}` };
     }
 
-    const data = await response.json();
+    const data = await response.json() as { sid?: string };
     return { success: true, sid: data.sid };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };

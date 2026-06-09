@@ -22,6 +22,8 @@ const ROWID_FILE = '/tmp/justice_last_rowid';
 const LOG_FILE = '/tmp/justice-imessage.log';
 const ERROR_LOG = '/tmp/justice-imessage-error.log';
 const WEBHOOK_URL = 'http://localhost:3002/webhook/executive';
+const CHAT_DB = `file:${process.env.HOME}/Library/Messages/chat.db?mode=ro`;
+const SQLITE3 = '/usr/bin/sqlite3';
 
 // --- Helpers ---
 function log(msg) {
@@ -126,18 +128,46 @@ function readStdin() {
   });
 }
 
+/**
+ * Query chat.db directly for new inbound messages. Used when the listener is
+ * launched without a stdin pipe (e.g. by node directly from the LaunchAgent).
+ * The system sqlite3 runs as a child of node and inherits node's Full Disk
+ * Access, so this works under launchd once node is granted FDA — no /bin/bash
+ * (which can't be granted FDA) is involved.
+ */
+function readNewMessagesFromDb() {
+  let lastRowid = 0;
+  try { lastRowid = parseInt(fs.readFileSync(ROWID_FILE, 'utf8').trim(), 10) || 0; } catch {}
+  const sql = `SELECT m.rowid AS ROWID, m.text, hex(m.attributedBody) AS attributedBodyHex, h.id AS sender `
+    + `FROM message m JOIN handle h ON m.handle_id = h.rowid `
+    + `WHERE m.rowid > ${lastRowid} AND m.is_from_me = 0 `
+    + `AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL) `
+    + `ORDER BY m.rowid ASC LIMIT 20`;
+  try {
+    const out = execSync(`${SQLITE3} -json "${CHAT_DB}" "${sql}"`, { encoding: 'utf8', timeout: 8000 }).trim();
+    return out ? JSON.parse(out) : [];
+  } catch (err) {
+    logError(`chat.db read failed: ${err.message}`);
+    return [];
+  }
+}
+
 // --- Main ---
 async function main() {
-  // Read JSON rows from stdin (piped from sqlite3 -json)
+  // Rows arrive via stdin (bash wrapper pipes sqlite3 -json) OR, when launched
+  // directly by node (LaunchAgent with Full Disk Access), we read chat.db here.
   const input = await readStdin();
-  if (!input) return; // no new messages
 
   let rows;
-  try {
-    rows = JSON.parse(input);
-  } catch (err) {
-    logError(`Failed to parse stdin JSON: ${err.message}`);
-    return;
+  if (input) {
+    try {
+      rows = JSON.parse(input);
+    } catch (err) {
+      logError(`Failed to parse stdin JSON: ${err.message}`);
+      return;
+    }
+  } else {
+    rows = readNewMessagesFromDb();
   }
 
   if (!Array.isArray(rows) || rows.length === 0) return;

@@ -33,7 +33,7 @@ export async function queryCaseLaw(
       return getFallbackCases(statuteCitation, keywords);
     }
 
-    const data = await response.json();
+    const data = await response.json() as { results?: Array<Record<string, unknown>> };
     return (data.results ?? []).map((r: Record<string, unknown>) => ({
       caseName: r.caseName as string,
       citation: r.citation as string,

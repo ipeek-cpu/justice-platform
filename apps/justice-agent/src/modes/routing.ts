@@ -45,7 +45,7 @@ export async function routeCaseToNetwork(
 }
 
 function rankAttorneys(attorneys: Attorney[], casePackage: CasePackage): Attorney[] {
-  const caseCategories = new Set(casePackage.primaryStatutes.map(s => s.category));
+  const caseCategories = new Set<string>(casePackage.primaryStatutes.map(s => s.category));
 
   return attorneys
     .map(attorney => {

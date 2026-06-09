@@ -1,5 +1,14 @@
 # Autonomous Batch Execution — SKILL.md
 
+> ⚠️ **DEPRECATED (2026-06-09).** This pipeline is disabled by default and is no
+> longer used to develop the holistic app — it was superseded by Claude Code
+> remote work. All batch start/resume/overnight runs, single-bead autonomous
+> runs, Claude Code subprocess spawning, startup batch recovery, stuck-task
+> detection, and the `unstick_task` tool are gated behind
+> `JUSTICE_AUTONOMOUS_BATCH_ENABLED` (default off). The code is retained for a
+> possible future revisit. Set `JUSTICE_AUTONOMOUS_BATCH_ENABLED=true` to
+> re-enable. See `apps/justice-agent/src/config/feature-flags.ts`.
+
 ## Purpose
 This skill defines the autonomous batch execution system for the Justice agent.
 Isaiah texts "hlstc batch m3-sessions" and Justice runs all beads to completion

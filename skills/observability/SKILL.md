@@ -1,5 +1,11 @@
 # Observability — Justice Execution Monitoring
 
+> ⚠️ **DEPRECATED (2026-06-09).** The stuck-task detection and `unstick_task`
+> flow documented here are part of the autonomous-batch pipeline, which is
+> disabled by default behind `JUSTICE_AUTONOMOUS_BATCH_ENABLED`. The 8am cron no
+> longer emits "may be stuck" pings unless the flag is set. The execution logger
+> itself still records events when the pipeline is enabled.
+
 ## Layers
 
 ### 1. Execution Logger (`execution-logger.ts`)

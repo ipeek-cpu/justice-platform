@@ -17,6 +17,7 @@ import { startCronJobs } from './cron/schedule';
 import { getActiveBatches, saveBatchState, deleteBatchState } from './modes/batch-runner';
 import { cleanupStaleWorktrees } from './integrations/github';
 import { listProjects } from './registry/ios-projects';
+import { isAutonomousBatchEnabled } from './config/feature-flags';
 
 const execAsync = promisify(exec);
 
@@ -53,6 +54,13 @@ async function cleanupOnStartup(): Promise<void> {
   } catch {}
 
   // 2. Mark stale 'running' batches — all beads done → delete, partial → failed
+  // DEPRECATED (2026-06-09): batch recovery only runs when the autonomous-batch
+  // pipeline is enabled. Orphaned-process cleanup above always runs as a safety net.
+  if (!isAutonomousBatchEnabled()) {
+    console.log('[startup] Autonomous batch disabled — skipping batch/worktree recovery');
+    console.log('[startup] Cleanup complete');
+    return;
+  }
   try {
     const activeBatches = await getActiveBatches();
     for (const batch of activeBatches) {

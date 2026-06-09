@@ -32,6 +32,7 @@ import { createApproval, formatStamp, listPendingApprovals } from '../integratio
 import { executionLogger } from '../integrations/execution-logger';
 import { shellExec } from '../integrations/shell-exec';
 import { runPhase, waitForApproval, type TaskSession } from './code-executor';
+import { isAutonomousBatchEnabled, BATCH_DISABLED_MESSAGE } from '../config/feature-flags';
 
 const execAsync = promisify(exec);
 
@@ -1240,6 +1241,7 @@ async function executeTool(
     }
 
     case 'ios_run_overnight': {
+      if (!isAutonomousBatchEnabled()) return JSON.stringify({ error: BATCH_DISABLED_MESSAGE });
       const project = getProject(input.project_id as string);
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
       // Fire and forget — runs async, reports via iMessage at completion
@@ -1250,6 +1252,7 @@ async function executeTool(
     }
 
     case 'ios_start_bead': {
+      if (!isAutonomousBatchEnabled()) return JSON.stringify({ error: BATCH_DISABLED_MESSAGE });
       const project = getProject(input.project_id as string);
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
 
@@ -1466,6 +1469,7 @@ async function executeTool(
     }
 
     case 'unstick_task': {
+      if (!isAutonomousBatchEnabled()) return JSON.stringify({ error: BATCH_DISABLED_MESSAGE });
       const beadId = input.bead_id as string;
       const checkouts = await listActiveCheckouts();
       const checkout = checkouts.find(c => c.beadId === beadId);
@@ -1522,6 +1526,7 @@ async function executeTool(
     }
 
     case 'ios_start_batch': {
+      if (!isAutonomousBatchEnabled()) return JSON.stringify({ error: BATCH_DISABLED_MESSAGE });
       const project = getProject(input.project_id as string);
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
 
@@ -1739,6 +1744,7 @@ async function executeTool(
     }
 
     case 'ios_resume_batch': {
+      if (!isAutonomousBatchEnabled()) return JSON.stringify({ error: BATCH_DISABLED_MESSAGE });
       let batchState: BatchState | null = null;
 
       if (input.batch_id) {

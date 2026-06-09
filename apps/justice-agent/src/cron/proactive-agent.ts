@@ -4,6 +4,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { executionLogger } from '../integrations/execution-logger';
+import { isAutonomousBatchEnabled } from '../config/feature-flags';
 
 const execAsync = promisify(exec);
 const ISAIAH = process.env.APPROVED_NUMBER_ISAIAH!;
@@ -55,19 +56,23 @@ export async function runProactiveChecks(): Promise<void> {
   }
 
   // Check 5: Stuck task detection (no log event for 30+ min)
-  const activeTasks = executionLogger.getActiveTasks();
-  for (const task of activeTasks) {
-    const lastEvent = executionLogger.getLastEventForBead(task.beadId!);
-    if (!lastEvent?.ts) continue;
-    const minutesSinceLastEvent = Math.round(
-      (Date.now() - new Date(lastEvent.ts).getTime()) / 60000
-    );
-    if (minutesSinceLastEvent >= 30) {
-      alerts.push(
-        `Task ${task.beadId} (${task.project}) may be stuck — ` +
-        `last event ${minutesSinceLastEvent} min ago (${lastEvent.event}). ` +
-        `Reply "unstick ${task.beadId}" to kill and reopen.`
+  // DEPRECATED (2026-06-09): part of the autonomous-batch pipeline, off by
+  // default. Gated so stale execution-log entries no longer fire daily pings.
+  if (isAutonomousBatchEnabled()) {
+    const activeTasks = executionLogger.getActiveTasks();
+    for (const task of activeTasks) {
+      const lastEvent = executionLogger.getLastEventForBead(task.beadId!);
+      if (!lastEvent?.ts) continue;
+      const minutesSinceLastEvent = Math.round(
+        (Date.now() - new Date(lastEvent.ts).getTime()) / 60000
       );
+      if (minutesSinceLastEvent >= 30) {
+        alerts.push(
+          `Task ${task.beadId} (${task.project}) may be stuck — ` +
+          `last event ${minutesSinceLastEvent} min ago (${lastEvent.event}). ` +
+          `Reply "unstick ${task.beadId}" to kill and reopen.`
+        );
+      }
     }
   }
 

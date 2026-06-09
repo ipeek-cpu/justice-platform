@@ -12,6 +12,7 @@ import { atomicClaim, renewClaim, cleanupTask } from '@justice/shared-types';
 import { notionLogger, type WorkPhase } from '../integrations/notion-logger';
 import { createApproval, getApproval, formatStamp } from '../integrations/approval-gate';
 import { executionLogger } from '../integrations/execution-logger';
+import { isAutonomousBatchEnabled } from '../config/feature-flags';
 
 const execAsync = promisify(exec);
 
@@ -47,6 +48,14 @@ export interface RunPhaseOptions {
  */
 export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: RunPhaseOptions): Promise<PhaseResult> {
   const start = Date.now();
+
+  // DEPRECATED (2026-06-09): hard safety net. The autonomous-batch pipeline is
+  // off by default, so no Claude Code subprocess may be spawned regardless of
+  // which entry point called us. Re-enable via JUSTICE_AUTONOMOUS_BATCH_ENABLED.
+  if (!isAutonomousBatchEnabled()) {
+    console.warn('[code-executor] Autonomous batch disabled — refusing to spawn subprocess for', session.beadId);
+    return { phaseId: phase.id, success: false, output: 'Autonomous batch execution is deprecated and disabled.', duration: '0m', exitCode: 1 };
+  }
 
   // Only check claim on first phase — session already owns it after that
   if (phase.number === 1 && !opts?.skipClaim) {

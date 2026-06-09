@@ -36,6 +36,7 @@ import { isAutonomousBatchEnabled, BATCH_DISABLED_MESSAGE } from '../config/feat
 import { runJobDiscovery } from './job-discovery';
 import { runJobDigest } from '../nudge/job-digest';
 import { runApplyAssist } from './apply-assist';
+import { addDynamicTarget, enabledTargets } from '../config/target-companies';
 
 const execAsync = promisify(exec);
 
@@ -632,6 +633,27 @@ const TOOL_DEFINITIONS = [
       required: [] as string[]
     }
   },
+  {
+    name: 'seed_job_target',
+    description: 'Add a company/source to the job-discovery target list at runtime — no code change, picked up on the next run_job_discovery. Greenhouse/Lever need a board slug; serpapi/workday use a Google Jobs query (requires SERPAPI_KEY).',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        name: { type: 'string', description: 'Company/source display name (e.g. "Acme")' },
+        ats: { type: 'string', enum: ['greenhouse', 'lever', 'serpapi', 'workday'], description: 'Sourcing path' },
+        slug: { type: 'string', description: 'Board slug for greenhouse/lever (e.g. "stripe")' },
+        query: { type: 'string', description: 'Google Jobs query for serpapi/workday (e.g. "Acme senior data engineer")' },
+        lane: { type: 'string', enum: ['stable-FT', 'contract/startup'], description: 'Default lane (optional)' },
+        industry: { type: 'string', description: 'Industry hint for scoring (optional)' }
+      },
+      required: ['name', 'ats'] as string[]
+    }
+  },
+  {
+    name: 'list_job_targets',
+    description: 'List the job-discovery target companies/sources currently enabled (static registry + runtime-seeded).',
+    input_schema: { type: 'object' as const, properties: {}, required: [] as string[] }
+  },
 ];
 
 async function buildSystemPrompt(callerIdentity: string, currentDate: string): Promise<string> {
@@ -699,6 +721,8 @@ Job search commands:
 - "find jobs" or "run job discovery" → run_job_discovery (source + score roles into the Notion jobs DB)
 - "job digest" or "any new jobs" → job_digest (text the top new matches now)
 - "apply assist" or "draft outreach for jobs" → apply_assist (shortlist + approval-gated outreach drafts; never auto-submits or sends)
+- "track [company]" / "add greenhouse|lever [slug]" / "seed job target" → seed_job_target (add a source at runtime; greenhouse/lever need a slug, serpapi needs a query)
+- "list job targets" → list_job_targets
 
 Direct shell operations (git rm, bd create, gh, etc.) → shell_exec
 Examples:
@@ -1269,6 +1293,30 @@ async function executeTool(
         suggestions: result.suggestions,
         notion: link
       });
+    }
+
+    case 'seed_job_target': {
+      const ats = input.ats as 'greenhouse' | 'lever' | 'serpapi' | 'workday';
+      if ((ats === 'greenhouse' || ats === 'lever') && !input.slug) {
+        return JSON.stringify({ error: `${ats} targets need a board slug (e.g. "stripe").` });
+      }
+      const res = addDynamicTarget({
+        name: input.name as string,
+        ats,
+        slug: input.slug as string | undefined,
+        query: input.query as string | undefined,
+        lane: (input.lane as 'stable-FT' | 'contract/startup') ?? 'stable-FT',
+        industry: input.industry as string | undefined,
+        enabled: true,
+      });
+      return JSON.stringify(res.added
+        ? { message: `Added ${input.name} (${ats}${input.slug ? ' / ' + input.slug : input.query ? ' / "' + input.query + '"' : ''}). It'll be sourced on the next job discovery run.` }
+        : { error: `Not added: ${res.reason}.` });
+    }
+
+    case 'list_job_targets': {
+      const targets = enabledTargets().map(t => ({ name: t.name, ats: t.ats, slug: t.slug, query: t.query, lane: t.lane }));
+      return JSON.stringify({ count: targets.length, targets });
     }
 
     case 'run_job_discovery': {

@@ -16,6 +16,9 @@
  *   Lever:      https://api.lever.co/v0/postings/{slug}?mode=json
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 export type ATS = 'greenhouse' | 'lever' | 'workday' | 'serpapi';
 
 /** Lane the company's roles default into; per-role scoring can still re-tag. */
@@ -73,7 +76,44 @@ export const TARGET_COMPANIES: TargetCompany[] = [
   ...WORKDAY_ENTERPRISE_TARGETS,
 ];
 
-/** Enabled targets only (default-on unless explicitly disabled). */
+/**
+ * Runtime-editable targets, seeded ad hoc (e.g. via the seed_job_target tool)
+ * with NO code change. Stored as JSON in memory/ (gitignored) and merged into
+ * enabledTargets(), so a newly-seeded company is sourced on the next run.
+ */
+const DYNAMIC_TARGETS_FILE = path.join(
+  process.env.HOME!,
+  'Developer/justice-repo/memory/job-targets.json',
+);
+
+export function loadDynamicTargets(): TargetCompany[] {
+  try {
+    if (!fs.existsSync(DYNAMIC_TARGETS_FILE)) return [];
+    const raw = JSON.parse(fs.readFileSync(DYNAMIC_TARGETS_FILE, 'utf8'));
+    return Array.isArray(raw) ? (raw as TargetCompany[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function targetKey(c: TargetCompany): string {
+  return `${c.ats}:${(c.slug ?? c.query ?? c.name).toLowerCase()}`;
+}
+
+/** Append a target to the runtime store. Idempotent on (ats, slug|query|name). */
+export function addDynamicTarget(t: TargetCompany): { added: boolean; reason?: string } {
+  const dynamic = loadDynamicTargets();
+  const key = targetKey(t);
+  if (dynamic.some((d) => targetKey(d) === key) || TARGET_COMPANIES.some((c) => targetKey(c) === key)) {
+    return { added: false, reason: 'already tracked' };
+  }
+  dynamic.push(t);
+  fs.mkdirSync(path.dirname(DYNAMIC_TARGETS_FILE), { recursive: true });
+  fs.writeFileSync(DYNAMIC_TARGETS_FILE, JSON.stringify(dynamic, null, 2), 'utf8');
+  return { added: true };
+}
+
+/** Enabled targets only — static registry + runtime-seeded (default-on unless disabled). */
 export function enabledTargets(): TargetCompany[] {
-  return TARGET_COMPANIES.filter((c) => c.enabled !== false);
+  return [...TARGET_COMPANIES, ...loadDynamicTargets()].filter((c) => c.enabled !== false);
 }

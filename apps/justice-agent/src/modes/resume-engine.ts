@@ -40,19 +40,26 @@ export async function generateTailoredResume(target: ResumeTarget): Promise<Resu
     max_tokens: 4096,
     system: `You are tailoring a resume YAML for a specific job description.
 
+SCHEMA (one-page resume):
+- summary: a single prose paragraph
+- core_capabilities: a map of grouped skill lists (Data Engineering, Big Data & Warehouses, Cloud & DevOps, Languages, APIs & Full-Stack, AI-Enhanced Development)
+- experience: a list of { company, title, dates, location, context?, bullets[] }
+- education: a list of { institution, degree, dates }
+
 WHAT YOU MUST DO:
-- Rephrase bullet points to mirror the JD's language, keywords, and terminology
+- Rephrase the bullets within each experience entry to mirror the JD's language, keywords, and terminology
 - Reframe accomplishments to emphasize the aspects most relevant to this role
 - Reorder bullets within each role to lead with the strongest JD-aligned points
-- Reorder skills lists to lead with what the JD prioritizes
-- Remove bullets that are irrelevant to this JD (keep at least 3 per role)
-- Adjust the role_targeting section to match the JD
+- Reorder items within each core_capabilities group to lead with what the JD prioritizes
+- Tighten the summary so it leads with the JD's priorities (same facts, better framing)
+- Remove bullets that are irrelevant to this JD (keep at least 3 per role; roles with fewer than 3 keep all)
 
 WHAT YOU MUST NEVER DO:
 - NEVER invent experiences, projects, metrics, or accomplishments that aren't in the master
 - NEVER fabricate skills, certifications, titles, dates, or companies
 - NEVER add entirely new bullet points — only rephrase or remove existing ones
-- NEVER change job titles, company names, dates, or education details
+- NEVER change job titles, company names, dates, location, context, or education details
+- NEVER add or rename core_capabilities groups, or add skills not already present
 - NEVER inflate metrics (e.g. "10%" cannot become "50%")
 
 REPHRASING GUIDELINES:
@@ -203,27 +210,30 @@ async function logResumeToNotion(pageId: string, result: ResumeResult): Promise<
 function buildDiffSummary(master: any, tailored: any, target: ResumeTarget): string {
   const lines: string[] = [`Tailored for: ${target.roleTitle} at ${target.companyName}`];
 
-  // Check role targeting changes
-  if (tailored.role_targeting?.title !== master.role_targeting?.title) {
-    lines.push(`Role title: "${master.role_targeting?.title}" → "${tailored.role_targeting?.title}"`);
+  // Summary rewritten?
+  if ((tailored.summary ?? '') !== (master.summary ?? '')) {
+    lines.push('Summary rephrased for this JD');
   }
 
-  // Count bullets removed per experience
+  // Count bullets removed per experience entry
   const masterExp = master.experience ?? [];
   const tailoredExp = tailored.experience ?? [];
   masterExp.forEach((role: any, i: number) => {
-    const masterCount = role.responsibilities?.length ?? 0;
-    const tailoredCount = tailoredExp[i]?.responsibilities?.length ?? 0;
+    const masterCount = role.bullets?.length ?? 0;
+    const tailoredCount = tailoredExp[i]?.bullets?.length ?? 0;
     if (tailoredCount < masterCount) {
       lines.push(`${role.company}: removed ${masterCount - tailoredCount} bullet(s)`);
     }
   });
 
-  // Check skills reordering
-  const masterSkills = Object.keys(master.skills ?? {});
-  const tailoredSkills = Object.keys(tailored.skills ?? {});
-  if (JSON.stringify(masterSkills) !== JSON.stringify(tailoredSkills)) {
-    lines.push('Skills sections reordered');
+  // Check core_capabilities reordering (groups should be identical; items may be reordered)
+  const masterCaps = master.core_capabilities ?? {};
+  const tailoredCaps = tailored.core_capabilities ?? {};
+  const reordered = Object.keys(masterCaps).some(
+    (group) => JSON.stringify(masterCaps[group]) !== JSON.stringify(tailoredCaps[group]),
+  );
+  if (reordered) {
+    lines.push('Core capabilities reordered to lead with JD priorities');
   }
 
   return lines.join('\n');

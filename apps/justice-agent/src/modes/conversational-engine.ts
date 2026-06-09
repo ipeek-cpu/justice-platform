@@ -33,6 +33,10 @@ import { executionLogger } from '../integrations/execution-logger';
 import { shellExec } from '../integrations/shell-exec';
 import { runPhase, waitForApproval, type TaskSession } from './code-executor';
 import { isAutonomousBatchEnabled, BATCH_DISABLED_MESSAGE } from '../config/feature-flags';
+import { runJobDiscovery } from './job-discovery';
+import { runJobDigest } from '../nudge/job-digest';
+import { runApplyAssist } from './apply-assist';
+import { addDynamicTarget, enabledTargets } from '../config/target-companies';
 
 const execAsync = promisify(exec);
 
@@ -606,6 +610,50 @@ const TOOL_DEFINITIONS = [
       required: ['command']
     }
   },
+  {
+    name: 'run_job_discovery',
+    description: 'Run the job-discovery pipeline now: source roles from enabled target companies, score them against the resume with Claude, and store new matches in the Notion jobs DB (scores in-memory if no jobs DB is configured).',
+    input_schema: { type: 'object' as const, properties: {}, required: [] as string[] }
+  },
+  {
+    name: 'job_digest',
+    description: 'Send the job digest now — the top new matches from the Notion jobs DB, via iMessage. Bypasses the once-per-day guard.',
+    input_schema: { type: 'object' as const, properties: {}, required: [] as string[] }
+  },
+  {
+    name: 'apply_assist',
+    description: 'Surface a shortlist of the best-fit roles and, only on explicit approval, draft LinkedIn outreach for Isaiah to review and send. NEVER submits applications or sends messages. Sources + scores fresh, then texts the shortlist and an approval request.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        context: { type: 'string', description: 'Short context for the outreach angle, e.g. "senior data engineering roles".' },
+        top_n: { type: 'number', description: 'Max roles to shortlist (default 5).' },
+        min_score: { type: 'number', description: 'Minimum fit score 0-100 to qualify (default 70).' }
+      },
+      required: [] as string[]
+    }
+  },
+  {
+    name: 'seed_job_target',
+    description: 'Add a company/source to the job-discovery target list at runtime — no code change, picked up on the next run_job_discovery. Greenhouse/Lever need a board slug; serpapi/workday use a Google Jobs query (requires SERPAPI_KEY).',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        name: { type: 'string', description: 'Company/source display name (e.g. "Acme")' },
+        ats: { type: 'string', enum: ['greenhouse', 'lever', 'serpapi', 'workday'], description: 'Sourcing path' },
+        slug: { type: 'string', description: 'Board slug for greenhouse/lever (e.g. "stripe")' },
+        query: { type: 'string', description: 'Google Jobs query for serpapi/workday (e.g. "Acme senior data engineer")' },
+        lane: { type: 'string', enum: ['stable-FT', 'contract/startup'], description: 'Default lane (optional)' },
+        industry: { type: 'string', description: 'Industry hint for scoring (optional)' }
+      },
+      required: ['name', 'ats'] as string[]
+    }
+  },
+  {
+    name: 'list_job_targets',
+    description: 'List the job-discovery target companies/sources currently enabled (static registry + runtime-seeded).',
+    input_schema: { type: 'object' as const, properties: {}, required: [] as string[] }
+  },
 ];
 
 async function buildSystemPrompt(callerIdentity: string, currentDate: string): Promise<string> {
@@ -668,6 +716,13 @@ iOS project commands — registered projects: ${listProjects().map(p => p.id).jo
 - "justice status" or "what are you doing" → justice_status
 - "unstick [bead-id]" → unstick_task (kill stuck task, release lock)
 - "justice register [project-id]" → justice_register (register a new project from Doppler env vars)
+
+Job search commands:
+- "find jobs" or "run job discovery" → run_job_discovery (source + score roles into the Notion jobs DB)
+- "job digest" or "any new jobs" → job_digest (text the top new matches now)
+- "apply assist" or "draft outreach for jobs" → apply_assist (shortlist + approval-gated outreach drafts; never auto-submits or sends)
+- "track [company]" / "add greenhouse|lever [slug]" / "seed job target" → seed_job_target (add a source at runtime; greenhouse/lever need a slug, serpapi needs a query)
+- "list job targets" → list_job_targets
 
 Direct shell operations (git rm, bd create, gh, etc.) → shell_exec
 Examples:
@@ -1238,6 +1293,63 @@ async function executeTool(
         suggestions: result.suggestions,
         notion: link
       });
+    }
+
+    case 'seed_job_target': {
+      const ats = input.ats as 'greenhouse' | 'lever' | 'serpapi' | 'workday';
+      if ((ats === 'greenhouse' || ats === 'lever') && !input.slug) {
+        return JSON.stringify({ error: `${ats} targets need a board slug (e.g. "stripe").` });
+      }
+      const res = addDynamicTarget({
+        name: input.name as string,
+        ats,
+        slug: input.slug as string | undefined,
+        query: input.query as string | undefined,
+        lane: (input.lane as 'stable-FT' | 'contract/startup') ?? 'stable-FT',
+        industry: input.industry as string | undefined,
+        enabled: true,
+      });
+      return JSON.stringify(res.added
+        ? { message: `Added ${input.name} (${ats}${input.slug ? ' / ' + input.slug : input.query ? ' / "' + input.query + '"' : ''}). It'll be sourced on the next job discovery run.` }
+        : { error: `Not added: ${res.reason}.` });
+    }
+
+    case 'list_job_targets': {
+      const targets = enabledTargets().map(t => ({ name: t.name, ats: t.ats, slug: t.slug, query: t.query, lane: t.lane }));
+      return JSON.stringify({ count: targets.length, targets });
+    }
+
+    case 'run_job_discovery': {
+      const r = await runJobDiscovery();
+      return JSON.stringify({
+        sourced: r.sourced,
+        new_after_dedup: r.newAfterDedup,
+        scored: r.scored.length,
+        stored: r.stored,
+        ...(r.sourced === 0 && { note: 'No target companies are enabled yet (config/target-companies.ts) — nothing to source.' }),
+      });
+    }
+
+    case 'job_digest': {
+      await runJobDigest(true);
+      return JSON.stringify({ message: 'Job digest sent (nothing sent if there were no new matches or the jobs DB is not configured).' });
+    }
+
+    case 'apply_assist': {
+      const ctx = (input.context as string) ?? 'data engineering roles';
+      const opts = {
+        topN: typeof input.top_n === 'number' ? (input.top_n as number) : undefined,
+        minScore: typeof input.min_score === 'number' ? (input.min_score as number) : undefined,
+      };
+      // Fire-and-forget: source + score, then runApplyAssist surfaces the shortlist,
+      // pings Isaiah for approval, and drafts outreach (for manual review/send) ONLY on YES.
+      (async () => {
+        const { scored } = await runJobDiscovery();
+        await runApplyAssist(scored, ctx, opts);
+      })().catch(err => {
+        if (ISAIAH) sendIMessage(ISAIAH, `Apply-assist failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+      });
+      return JSON.stringify({ message: 'Apply-assist started — sourcing + scoring now. I\'ll text you the shortlist and an approval request before drafting any outreach. Nothing is ever submitted or sent automatically.' });
     }
 
     case 'ios_run_overnight': {

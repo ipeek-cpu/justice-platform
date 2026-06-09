@@ -1,6 +1,8 @@
 import cron from 'node-cron';
 import { runProactiveChecks, readState, updateState } from './proactive-agent';
 import { sendIMessage } from '@justice/messaging';
+import { runJobDiscovery } from '../modes/job-discovery';
+import { runJobDigest } from '../nudge/job-digest';
 
 export function startCronJobs(): void {
   // 8am every morning, Mac Mini local time
@@ -10,6 +12,19 @@ export function startCronJobs(): void {
       console.error('[cron] Proactive check failed:', err)
     );
   });
+
+  // 8:30am CT — job discovery + digest, after the 8:00 morning brief.
+  cron.schedule('30 8 * * *', async () => {
+    console.log('[cron] Running job discovery + digest...');
+    try {
+      await runJobDiscovery();
+    } catch (err) {
+      console.error('[cron] Job discovery failed:', err);
+    }
+    await runJobDigest().catch(err =>
+      console.error('[cron] Job digest failed:', err)
+    );
+  }, { timezone: 'America/Chicago' });
 
   // 7am daily — morning summary backup (only fires if an overnight run completed)
   cron.schedule('0 7 * * *', async () => {
@@ -69,5 +84,6 @@ export function startCronJobs(): void {
 
   console.log('[cron] Proactive agent scheduled: 8am daily');
   console.log('[cron] Morning summary check scheduled: 7am CT daily');
+  console.log('[cron] Job discovery + digest scheduled: 8:30am CT daily');
   console.log('[cron] Sunday weekly prep scheduled: 8pm CT Sundays');
 }

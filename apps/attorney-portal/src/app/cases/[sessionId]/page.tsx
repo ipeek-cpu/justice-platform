@@ -51,7 +51,7 @@ export default async function CaseDetailPage({
 }: {
   params: Promise<{ sessionId: string }>;
 }) {
-  const { id } = await params;
+  const { sessionId: id } = await params;
   const c = ISAIAH_CASE;
 
   // Only serve the case we have

@@ -52,7 +52,7 @@ async function generateBriefMessage(data: {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return buildFallbackMessage(data);
 
-  const model = process.env.CLAUDE_MODEL ?? 'claude-sonnet-4-20250514';
+  const model = process.env.CLAUDE_MODEL ?? 'claude-sonnet-4-6';
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {

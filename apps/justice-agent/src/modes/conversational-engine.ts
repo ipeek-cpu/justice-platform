@@ -2039,7 +2039,7 @@ export async function handleMessage(
     return { response: 'Claude API not configured — set ANTHROPIC_API_KEY.', updatedHistory: conversationHistory };
   }
 
-  const model = process.env.CLAUDE_MODEL ?? 'claude-sonnet-4-20250514';
+  const model = process.env.CLAUDE_MODEL ?? 'claude-sonnet-4-6';
   const TZ = process.env.JUSTICE_TIMEZONE ?? 'America/Chicago';
   const now = new Date();
 

@@ -6,11 +6,14 @@
  */
 
 import { getTasksNeedingNudge, logAuditEntry } from '../db/queries';
-import { sendIMessage } from '@justice/messaging';
+import { dailyCount, incrDaily, isInDailySet, addToDailySet, sendGuardedIMessage } from './send-guard';
 
-// --- In-memory state ---
+// --- State ---
+// Authoritative guards (daily nudge count + which tasks were nudged) live in
+// Redis so they survive restarts / crash loops. The in-memory values below are
+// display mirrors for getNudgeState() and reset on restart (cosmetic only).
 
-let nudgedToday: Map<string, string> = new Map(); // taskId → YYYY-MM-DD
+let nudgedToday: Map<string, string> = new Map(); // taskId → YYYY-MM-DD (mirror)
 let nudgeCountToday = 0;
 let currentDay = todayStr();
 let paused = false;
@@ -78,7 +81,14 @@ export async function runTaskNudge(): Promise<void> {
   if (snoozedUntil && new Date() < snoozedUntil) return;
   if (snoozedUntil && new Date() >= snoozedUntil) snoozedUntil = null;
   if (isQuietHours()) return;
-  if (nudgeCountToday >= 2) return;
+
+  // Authoritative 2/day cap from Redis (survives restarts).
+  try {
+    if (await dailyCount('nudge') >= 2) return;
+  } catch (err) {
+    console.error('[nudge] Redis count read failed, skipping to avoid storm:', err);
+    return;
+  }
 
   const phoneNumber = process.env.APPROVED_NUMBER_ISAIAH;
   if (!phoneNumber) {
@@ -96,9 +106,17 @@ export async function runTaskNudge(): Promise<void> {
 
   if (allTasks.length === 0) return;
 
-  // Filter out already-nudged tasks today
+  // Filter out already-nudged tasks today (authoritative dedupe in Redis).
   const today = todayStr();
-  const newTasks = allTasks.filter(t => nudgedToday.get(t.id) !== today);
+  const newTasks: typeof allTasks = [];
+  try {
+    for (const t of allTasks) {
+      if (!(await isInDailySet('nudged', t.id))) newTasks.push(t);
+    }
+  } catch (err) {
+    console.error('[nudge] Redis dedupe read failed, skipping to avoid storm:', err);
+    return;
+  }
   if (newTasks.length === 0) return;
 
   // Categorize
@@ -147,9 +165,12 @@ export async function runTaskNudge(): Promise<void> {
 
   const message = lines.join('\n');
 
-  const result = await sendIMessage(phoneNumber, message);
-  if (result.success) {
+  const result = await sendGuardedIMessage(phoneNumber, message, 'task_nudge');
+  if (result.sent) {
     lastNudgeAt = new Date().toISOString();
+    // Persist authoritative guards, then update display mirrors.
+    await incrDaily('nudge').catch(err => console.error('[nudge] count persist failed:', err));
+    await addToDailySet('nudged', newTasks.map(t => t.id)).catch(err => console.error('[nudge] dedupe persist failed:', err));
     nudgeCountToday++;
     for (const t of newTasks) nudgedToday.set(t.id, today);
     console.log(`[nudge] Sent nudge #${nudgeCountToday} — ${newTasks.length} tasks`);
@@ -162,6 +183,6 @@ export async function runTaskNudge(): Promise<void> {
       details: `${newTasks.length} tasks, nudge #${nudgeCountToday}`,
     }).catch(err => console.error('[nudge] Audit log failed:', err));
   } else {
-    console.error('[nudge] iMessage send failed:', result.error);
+    console.error(`[nudge] Not sent (${result.reason})`);
   }
 }

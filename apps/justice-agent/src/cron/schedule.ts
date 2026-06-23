@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { runProactiveChecks, readState, updateState } from './proactive-agent';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { runJobDiscovery } from '../modes/job-discovery';
 import { runJobDigest } from '../nudge/job-digest';
 
@@ -75,7 +75,7 @@ export function startCronJobs(): void {
         `Reply with anything you want me to schedule, track, or follow up on.`,
       ].join('\n');
 
-      await sendIMessage(process.env.APPROVED_NUMBER_ISAIAH!, message);
+      await sendGuardedIMessage(process.env.APPROVED_NUMBER_ISAIAH!, message);
       console.log('[cron] Sunday weekly prep sent');
     } catch (err) {
       console.error('[cron] Sunday weekly prep failed:', err);

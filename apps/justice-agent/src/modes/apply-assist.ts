@@ -13,7 +13,7 @@
  */
 
 import { createApproval, getApproval, formatStamp } from '../integrations/approval-gate';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { draftOutreachBatch, type RecruiterTarget } from './linkedin-outreach';
 import type { ScoredJob } from './job-discovery';
 import type { Lane } from '../config/target-companies';
@@ -76,7 +76,7 @@ export async function runApplyAssist(
   const shortlist = buildShortlist(jobs, opts);
 
   if (shortlist.length === 0) {
-    if (ISAIAH) await sendIMessage(ISAIAH, `Apply-assist: no roles cleared the bar (min score ${opts.minScore ?? 70}).`);
+    if (ISAIAH) await sendGuardedIMessage(ISAIAH, `Apply-assist: no roles cleared the bar (min score ${opts.minScore ?? 70}).`);
     return { shortlist, drafted: false };
   }
 
@@ -84,7 +84,7 @@ export async function runApplyAssist(
   const stamp = await createApproval(SESSION, question, ISAIAH);
 
   if (ISAIAH) {
-    await sendIMessage(
+    await sendGuardedIMessage(
       ISAIAH,
       `Apply-assist shortlist — requirements:\n\n${formatRequirements(shortlist)}\n\n` +
         `${formatStamp(stamp)} ${question}\nReply "yes ${stamp}" to draft outreach (you review + send), or "no ${stamp}".`,
@@ -142,7 +142,7 @@ function waitForApproval(stamp: string, question: string): Promise<boolean> {
           resolve(false);
         } else if (Date.now() - lastPing > REPING_MS) {
           if (ISAIAH) {
-            await sendIMessage(ISAIAH, `Reminder: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`);
+            await sendGuardedIMessage(ISAIAH, `Reminder: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`);
           }
           lastPing = Date.now();
         }

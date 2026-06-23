@@ -7,9 +7,12 @@
  */
 
 import { getPendingTasksByAssignee, getCaseMetrics, logAuditEntry } from '../db/queries';
-import { sendIMessage } from '@justice/messaging';
+import { claimDaily, sendGuardedIMessage } from './send-guard';
 
-// --- In-memory state ---
+// --- State ---
+// The authoritative "already sent today" guard lives in Redis (claimDaily),
+// so it survives restarts / crash loops. lastBriefDate is an in-memory mirror
+// kept only for the status-display getter.
 
 let lastBriefDate: string | null = null;
 let enabled = true;
@@ -62,7 +65,7 @@ async function generateBriefMessage(data: {
       body: JSON.stringify({
         model,
         max_tokens: 300,
-        system: 'You are Justice, writing a morning briefing for Isaiah via iMessage. Be concise, warm, actionable. No bullet points unless 3+ items. Lead with the most urgent thing. If nothing is urgent, keep it to 1-2 sentences. Never exceed 500 characters.',
+        system: 'You are Justice, writing a morning briefing for Isaiah via iMessage. Be concise, warm, actionable. No bullet points unless 3+ items. Lead with the most urgent thing. If nothing is urgent, keep it to 1-2 sentences. Never exceed 500 characters. CRITICAL: Use ONLY the names, companies, deals, and facts present in the data below. Never invent or guess a person, company, case, or deal name. If the data is sparse, say so plainly rather than filling it in.',
         messages: [{
           role: 'user',
           content: `Generate a morning brief for today (${data.date}). Here's the data:\n\n${JSON.stringify(data, null, 2)}`,
@@ -106,9 +109,6 @@ export async function runMorningBrief(force = false): Promise<void> {
 
   const today = todayStrCT();
 
-  // Already sent today
-  if (lastBriefDate === today && !force) return;
-
   // Time window check (8:00–8:15 AM CT) unless forced
   if (!force) {
     const hour = getCTHour();
@@ -121,6 +121,20 @@ export async function runMorningBrief(force = false): Promise<void> {
     console.warn('[morning-brief] APPROVED_NUMBER_ISAIAH not set, skipping');
     return;
   }
+
+  // Claim the day BEFORE doing any work. This is the anti-storm guard: the
+  // claim is consumed once per Central day (Redis, survives restarts), so a
+  // crash loop or a failed send cannot cause repeated briefs. Manual force
+  // bypasses the claim.
+  if (!force) {
+    try {
+      if (!(await claimDaily('brief'))) return; // already handled today
+    } catch (err) {
+      console.error('[morning-brief] Redis claim failed, skipping to avoid storm:', err);
+      return;
+    }
+  }
+  lastBriefDate = today;
 
   // Gather data
   let pendingTasks: Awaited<ReturnType<typeof getPendingTasksByAssignee>>;
@@ -163,10 +177,9 @@ export async function runMorningBrief(force = false): Promise<void> {
     }
   }
 
-  // No tasks and no new cases — skip
+  // No tasks and no new cases — skip (day already claimed above)
   if (pendingTasks.length === 0 && caseMetrics.today === 0) {
-    lastBriefDate = today;
-    console.log('[morning-brief] Nothing to report, marking as sent');
+    console.log('[morning-brief] Nothing to report, skipping send');
     return;
   }
 
@@ -187,9 +200,8 @@ export async function runMorningBrief(force = false): Promise<void> {
     caseMetrics: { total: caseMetrics.total, today: caseMetrics.today },
   });
 
-  const result = await sendIMessage(phoneNumber, briefMessage);
-  if (result.success) {
-    lastBriefDate = today;
+  const result = await sendGuardedIMessage(phoneNumber, briefMessage, 'morning_brief');
+  if (result.sent) {
     console.log(`[morning-brief] Sent for ${today}`);
 
     logAuditEntry({
@@ -200,6 +212,8 @@ export async function runMorningBrief(force = false): Promise<void> {
       details: `tasks: ${pendingTasks.length}, overdue: ${overdue.length}, cases_today: ${caseMetrics.today}`,
     }).catch(err => console.error('[morning-brief] Audit log failed:', err));
   } else {
-    console.error('[morning-brief] iMessage send failed:', result.error);
+    // Day is already claimed, so we will NOT retry today even though this send
+    // did not go out — that is the intended anti-storm trade-off.
+    console.error(`[morning-brief] Not sent (${result.reason})`);
   }
 }

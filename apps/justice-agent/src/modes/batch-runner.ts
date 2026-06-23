@@ -13,7 +13,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { getRedis } from '../integrations/redis-client';
 import { notionLogger } from '../integrations/notion-logger';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { atomicClaim, cleanupTask } from '@justice/shared-types';
 import { runPhase, waitForApproval, type TaskSession } from './code-executor';
 import { runReviewAgent, parseReviewConcerns, createFixBeads } from './review-agent';
@@ -210,7 +210,7 @@ export async function runBatchAsync(
       // Branch not on origin and worktree gone — unrecoverable via resume
       state.status = 'failed';
       await saveBatchState(state);
-      await sendIMessage(ISAIAH,
+      await sendGuardedIMessage(ISAIAH,
         `Cannot resume ${state.batchId} — branch ${state.branch} not found on origin.\n` +
         `Completed beads: ${state.results.filter(r => r.status === 'completed').map(r => r.beadId).join(', ')}\n` +
         `Use ios_push_branch if commits exist locally, or start fresh.`
@@ -394,7 +394,7 @@ export async function runBatchAsync(
     state.status = 'failed';
     await saveBatchState(state);
     await notionLogger.logTimelineEvent(state.notionPageId, 'failed', 'No beads completed — batch failed');
-    await sendIMessage(ISAIAH,
+    await sendGuardedIMessage(ISAIAH,
       `Batch ${state.batchId} finished with 0 completions.\nCheck Notion: ${notionLogger.pageUrl(state.notionPageId)}`
     );
     await cleanupBatchWorktree(project, worktreePath);
@@ -437,7 +437,7 @@ export async function runBatchAsync(
     if (!retryBuild.success) {
       state.status = 'paused';
       await saveBatchState(state);
-      await sendIMessage(ISAIAH,
+      await sendGuardedIMessage(ISAIAH,
         `Build auto-fix failed for ${state.batchId}.\nErrors:\n${errors.slice(0, 400)}\nBranch: ${state.branch}\nNotion: ${notionLogger.pageUrl(state.notionPageId)}`
       );
       return;
@@ -471,7 +471,7 @@ export async function runBatchAsync(
 
     // Alert immediately on blockers
     if (blockers.length > 0) {
-      await sendIMessage(ISAIAH,
+      await sendGuardedIMessage(ISAIAH,
         `BLOCKER in batch ${state.batchId} (cycle ${currentCycle}):\n` +
         blockers.map(b => `- ${b.title}`).join('\n') + '\n' +
         `Notion: ${notionLogger.pageUrl(state.notionPageId)}`
@@ -484,7 +484,7 @@ export async function runBatchAsync(
 
       // CHECKLIST: Never fail silently on 0 fix beads for non-LOW concerns
       if (fixBeadIds.length === 0 && fixable.length > 0) {
-        await sendIMessage(ISAIAH,
+        await sendGuardedIMessage(ISAIAH,
           `WARNING: createFixBeads returned 0 beads for ${fixable.length} non-LOW concern(s) in batch ${state.batchId}.\n` +
           `Concerns:\n${fixable.map(c => `- [${c.severity}] ${c.title}`).join('\n')}\n` +
           `Notion: ${notionLogger.pageUrl(state.notionPageId)}\n\n` +
@@ -508,7 +508,7 @@ export async function runBatchAsync(
         `(${severityCounts.blocker}B/${severityCounts.high}H/${severityCounts.medium}M/${severityCounts.low}L)`
       );
 
-      await sendIMessage(ISAIAH,
+      await sendGuardedIMessage(ISAIAH,
         `Batch ${state.batchId} — review returned NEEDS_CHANGES.\n` +
         `${severityCounts.blocker} blocker, ${severityCounts.high} high, ${severityCounts.medium} medium, ${severityCounts.low} low.\n` +
         `Starting auto-fix cycle ${currentCycle + 1}/2 with ${fixBeadIds.length} fix bead(s).\n` +
@@ -546,7 +546,7 @@ export async function runBatchAsync(
         'waiting',
         `Auto-remediation exhausted (${currentCycle} cycles). ${remaining.length} concern(s) remain.`
       );
-      await sendIMessage(ISAIAH,
+      await sendGuardedIMessage(ISAIAH,
         `Batch ${state.batchId} — ${currentCycle} fix cycles done, still ${remaining.length} concern(s).\n` +
         `Needs your input. Notion: ${notionLogger.pageUrl(state.notionPageId)}`
       );
@@ -621,16 +621,16 @@ export async function runBatchAsync(
     state.status = 'approved';
     await saveBatchState(state);
     await notionLogger.logTimelineEvent(state.notionPageId, 'success', `PR created: ${prUrl}`);
-    await sendIMessage(ISAIAH, `Batch PR open: ${prUrl}`);
+    await sendGuardedIMessage(ISAIAH, `Batch PR open: ${prUrl}`);
 
     if (state.label) {
       const nextPhase = getNextPhase(project, state.label);
       if (nextPhase) {
-        await sendIMessage(ISAIAH,
+        await sendGuardedIMessage(ISAIAH,
           `Ready for ${nextPhase} when you are.\nText "${project.id} batch ${nextPhase}" to continue.`
         );
       } else if (isFinalPhase(project, state.label)) {
-        await sendIMessage(ISAIAH,
+        await sendGuardedIMessage(ISAIAH,
           `All phases complete. Migration done.\nAWS infra is ready to decommission when you are.`
         );
       }
@@ -647,7 +647,7 @@ export async function runBatchAsync(
     state.status = 'declined';
     await saveBatchState(state);
     await notionLogger.logTimelineEvent(state.notionPageId, 'failed', 'Push declined — beads reopened');
-    await sendIMessage(ISAIAH, `Batch push declined. ${completedBeads.length} bead(s) reopened.`);
+    await sendGuardedIMessage(ISAIAH, `Batch push declined. ${completedBeads.length} bead(s) reopened.`);
     await cleanupBatchWorktree(project, worktreePath);
     // Keep declined state for 1h visibility, then auto-expire
     const redis = getRedis();

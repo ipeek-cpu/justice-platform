@@ -1,4 +1,4 @@
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -80,7 +80,7 @@ export async function runProactiveChecks(): Promise<void> {
   if (alerts.length > 0) {
     const msg = `Good morning. ${alerts.length} item(s) need attention:\n` +
       alerts.map((a, i) => `${i + 1}. ${a}`).join('\n');
-    await sendIMessage(ISAIAH, msg);
+    await sendGuardedIMessage(ISAIAH, msg, 'proactive_alert');
   }
 }
 

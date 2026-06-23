@@ -1,6 +1,6 @@
 import { getClient } from '../integrations/notion-client';
 import { notionLogger } from '../integrations/notion-logger';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { updateState } from '../cron/proactive-agent';
 
 const ISAIAH = process.env.APPROVED_NUMBER_ISAIAH!;
@@ -52,7 +52,7 @@ export async function draftOutreachBatch(
 
   // Ping Isaiah
   const link = notionLogger.pageUrl(pageId);
-  await sendIMessage(
+  await sendGuardedIMessage(
     ISAIAH,
     `${drafts.length} LinkedIn draft(s) ready — Check Notion: ${link}\n\nReview and send manually.`
   );

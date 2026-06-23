@@ -253,6 +253,33 @@ export async function createCalendarEvent(
   }
 }
 
+/**
+ * Delete a calendar event by ID. Searches each connected account's primary
+ * calendar (events may live on any connected account) and deletes the first
+ * match. Used for cleaning up erroneously-created events.
+ */
+export async function deleteCalendarEvent(
+  callerIdentity: string,
+  eventId: string,
+): Promise<{ deleted: true; account: string } | { error: string }> {
+  try {
+    const allTokens = await getAllOAuthTokens(callerIdentity);
+    for (const token of allTokens) {
+      try {
+        const auth = await getAuthedClient(callerIdentity, token.accountEmail);
+        const calendar = google.calendar({ version: 'v3', auth });
+        await calendar.events.delete({ calendarId: 'primary', eventId });
+        return { deleted: true, account: token.accountEmail };
+      } catch {
+        // Not on this account (404) — try the next.
+      }
+    }
+    return { error: `Event ${eventId} not found on any connected account` };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Calendar event deletion failed' };
+  }
+}
+
 // --- Gmail ---
 
 /**

@@ -1,7 +1,7 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { notionLogger } from '../integrations/notion-logger';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { atomicClaim, cleanupTask } from '@justice/shared-types';
 import { runPhase } from './code-executor';
 import { runReviewAgent } from './review-agent';
@@ -28,7 +28,7 @@ export interface OvernightRunResult {
 export async function runOvernightSession(projectId: string): Promise<void> {
   const project = getProject(projectId);
   if (!project) {
-    await sendIMessage(ISAIAH, `Unknown project: ${projectId}`);
+    await sendGuardedIMessage(ISAIAH, `Unknown project: ${projectId}`);
     return;
   }
 
@@ -41,7 +41,7 @@ export async function runOvernightSession(projectId: string): Promise<void> {
     `Autonomous overnight run for ${project.name}. All unblocked beads will be processed.`
   );
 
-  await sendIMessage(
+  await sendGuardedIMessage(
     ISAIAH,
     `${project.name} overnight run started.\nCheck Notion for live progress: ${notionLogger.pageUrl(pageId)}`
   );
@@ -64,7 +64,7 @@ export async function runOvernightSession(projectId: string): Promise<void> {
   );
 
   if (projectBeads.length === 0) {
-    await sendIMessage(ISAIAH,
+    await sendGuardedIMessage(ISAIAH,
       `${project.name}: No unblocked beads found. Nothing to run tonight.`
     );
     return;
@@ -203,7 +203,7 @@ export async function runOvernightSession(projectId: string): Promise<void> {
     `Approve push? Reply "yes ${stamp}" or "no ${stamp}"`
   ].filter(Boolean).join('\n');
 
-  await sendIMessage(ISAIAH, summary);
+  await sendGuardedIMessage(ISAIAH, summary);
 
   // Poll for approval (check every 30s, timeout 12h)
   const approved = await new Promise<boolean>((resolve) => {
@@ -235,14 +235,14 @@ export async function runOvernightSession(projectId: string): Promise<void> {
     }
 
     await notionLogger.logTimelineEvent(pageId, 'success', `PR created: ${prUrl}`);
-    await sendIMessage(ISAIAH, `PR open: ${prUrl}`);
+    await sendGuardedIMessage(ISAIAH, `PR open: ${prUrl}`);
   } else if (!approved && done.length > 0) {
     // Push declined — reopen all beads
     for (const beadId of done) {
       await execAsync(`${process.env.HOME}/.local/bin/bd update ${beadId} --status open`).catch(() => {});
     }
     await notionLogger.logTimelineEvent(pageId, 'failed', 'Push declined — beads reopened');
-    await sendIMessage(ISAIAH, `Push declined. ${done.length} bead(s) reopened.`);
+    await sendGuardedIMessage(ISAIAH, `Push declined. ${done.length} bead(s) reopened.`);
   }
 }
 

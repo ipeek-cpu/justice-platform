@@ -19,7 +19,7 @@ import { appendToMemory } from '../memory/session-logger';
 import { draftOutreachBatch } from './linkedin-outreach';
 import { generateTailoredResume, generateBatch } from './resume-engine';
 import { notionLogger } from '../integrations/notion-logger';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { getProject, listProjects, reloadRegistry } from '../registry/ios-projects';
 import { listActiveCheckouts, atomicClaim, cleanupTask, releaseTask } from '@justice/shared-types';
 import { exec, execSync } from 'child_process';
@@ -181,6 +181,7 @@ const TOOL_DEFINITIONS = [
         proposed_time: { type: 'string', description: 'Proposed time for the meeting' },
         duration: { type: 'string', description: 'Meeting duration (e.g., "30 min", "1 hour")' },
         notes: { type: 'string', description: 'Additional notes' },
+        confirm: { type: 'boolean', description: 'Set true ONLY after the user explicitly confirms an unusually far-future date (>120 days out). Do not set by default.' },
       },
       required: ['title', 'attendees'],
     },
@@ -207,6 +208,7 @@ const TOOL_DEFINITIONS = [
           description: 'Array of events to create',
         },
         timezone: { type: 'string', description: 'IANA timezone (default: America/Chicago)' },
+        confirm: { type: 'boolean', description: 'Set true ONLY after the user explicitly confirms unusually far-future dates (>120 days out). Do not set by default.' },
       },
       required: ['events'],
     },
@@ -656,6 +658,36 @@ const TOOL_DEFINITIONS = [
   },
 ];
 
+/**
+ * Sanity-check a proposed calendar event start time before it hits Google
+ * Calendar. Blocks events in the past or absurdly far in the future (the
+ * "April 2027" class of bug, where stale conversation context made the model
+ * emit a wrong year). The far-future block is overridable with confirm=true so
+ * a genuinely distant event can still be scheduled after explicit confirmation.
+ */
+function validateEventDate(
+  startISO: string,
+  confirm = false,
+): { ok: true } | { ok: false; status: string; message: string } {
+  const start = new Date(startISO);
+  if (isNaN(start.getTime())) {
+    return { ok: false, status: 'need_time', message: `Could not parse "${startISO}". Use ISO format: YYYY-MM-DDTHH:MM.` };
+  }
+  const now = Date.now();
+  // 5-minute grace so "schedule for 2pm" at 1:59pm isn't rejected.
+  if (start.getTime() < now - 5 * 60 * 1000) {
+    const when = start.toLocaleString('en-US', { timeZone: 'America/Chicago' });
+    return { ok: false, status: 'need_confirmation', message: `That time (${when}) is in the past. Did you mean a future date? Re-state the exact date and time.` };
+  }
+  const maxDaysOut = parseInt(process.env.JUSTICE_CALENDAR_MAX_DAYS_OUT ?? '', 10) || 120;
+  const daysOut = (start.getTime() - now) / 86_400_000;
+  if (daysOut > maxDaysOut && !confirm) {
+    const label = start.toLocaleDateString('en-US', { timeZone: 'America/Chicago', month: 'long', day: 'numeric', year: 'numeric' });
+    return { ok: false, status: 'need_confirmation', message: `That lands on ${label} — ${Math.round(daysOut)} days out, beyond the normal ${maxDaysOut}-day window. If you really mean ${label}, re-issue the request with confirm: true. Otherwise double-check the year (did you mean this year?).` };
+  }
+  return { ok: true };
+}
+
 async function buildSystemPrompt(callerIdentity: string, currentDate: string): Promise<string> {
   let accountsSection = '';
   try {
@@ -679,6 +711,8 @@ Rules:
 - Always confirm before scheduling on another person's calendar.
 - Never share case data with unauthorized parties.
 - Never make legal recommendations.
+- NEVER invent or guess names of people, companies, cases, or deals. Refer only to entities that appear in the conversation, tool results, or stored data. If you don't have a name, ask or say you don't have it — do not fabricate one (no "Sarah Chin", no made-up deals).
+- When scheduling, never silently use a far-future or past date. Resolve relative dates against the current date shown above, and if a computed date is more than ~4 months out, confirm the year with the user before scheduling.
 - Log all actions for audit trail.
 - Be concise in responses — this is a text/iMessage conversation.
 - Calendar checks show events from ALL connected Google accounts.
@@ -892,6 +926,11 @@ async function executeTool(
       const startTime = parsed.toISOString();
       const endTime = new Date(parsed.getTime() + durationMinutes * 60 * 1000).toISOString();
 
+      const dateCheck = validateEventDate(startTime, input.confirm === true);
+      if (!dateCheck.ok) {
+        return JSON.stringify({ status: dateCheck.status, title: input.title, proposed_time: startTime, message: dateCheck.message });
+      }
+
       const result = await createCalendarEvent(callerIdentity, {
         title: input.title as string,
         attendees: (input.attendees as string[]) ?? [],
@@ -919,9 +958,17 @@ async function executeTool(
       const _tz = (input.timezone as string) || 'America/Chicago'; // reserved for future use; createCalendarEvent hardcodes America/Chicago
       const results: Array<{ title: string; date: string; status: string; link?: string; meet_link?: string; error?: string }> = [];
 
+      const confirmFarFuture = input.confirm === true;
       for (const evt of events) {
         const startTime = `${evt.date}T${evt.start_time}:00`;
         const endTime = `${evt.date}T${evt.end_time}:00`;
+
+        const dateCheck = validateEventDate(startTime, confirmFarFuture);
+        if (!dateCheck.ok) {
+          results.push({ title: evt.title, date: evt.date, status: 'skipped', error: dateCheck.message });
+          continue;
+        }
+
         const calResult = await createCalendarEvent(callerIdentity, {
           title: evt.title,
           attendees: [],
@@ -938,7 +985,8 @@ async function executeTool(
 
       const created = results.filter(r => r.status === 'created').length;
       const failed = results.filter(r => r.status === 'failed').length;
-      return JSON.stringify({ created, failed, total: events.length, details: results });
+      const skipped = results.filter(r => r.status === 'skipped').length;
+      return JSON.stringify({ created, failed, skipped, total: events.length, details: results });
     }
 
     case 'check_calendar': {
@@ -1150,7 +1198,7 @@ async function executeTool(
       }));
       const results = await generateBatch(targets, batchPageId);
       const link = notionLogger.pageUrl(batchPageId);
-      await sendIMessage(ISAIAH, `${results.length} resume(s) ready — Check Notion: ${link}`);
+      await sendGuardedIMessage(ISAIAH, `${results.length} resume(s) ready — Check Notion: ${link}`);
       return JSON.stringify({
         success: true,
         count: results.length,
@@ -1347,7 +1395,7 @@ async function executeTool(
         const { scored } = await runJobDiscovery();
         await runApplyAssist(scored, ctx, opts);
       })().catch(err => {
-        if (ISAIAH) sendIMessage(ISAIAH, `Apply-assist failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+        if (ISAIAH) sendGuardedIMessage(ISAIAH, `Apply-assist failed: ${err instanceof Error ? err.message : 'unknown error'}`);
       });
       return JSON.stringify({ message: 'Apply-assist started — sourcing + scoring now. I\'ll text you the shortlist and an approval request before drafting any outreach. Nothing is ever submitted or sent automatically.' });
     }
@@ -1358,7 +1406,7 @@ async function executeTool(
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
       // Fire and forget — runs async, reports via iMessage at completion
       runOvernightSession(input.project_id as string).catch(err =>
-        sendIMessage(ISAIAH, `Overnight run failed for ${project.name}: ${err.message}`)
+        sendGuardedIMessage(ISAIAH, `Overnight run failed for ${project.name}: ${err.message}`)
       );
       return JSON.stringify({ message: `${project.name} overnight run started. You'll get an iMessage when complete.` });
     }
@@ -1497,19 +1545,19 @@ async function executeTool(
               await execAsync(`${process.env.HOME}/.local/bin/bd close ${beadId} --reason "PR created: ${prUrl}"`).catch(() => {});
               executionLogger.log({ event: 'bead_complete', beadId, project: project.id, sessionId, prUrl });
               await notionLogger.logTimelineEvent(pageId, 'success', `PR created: ${prUrl}`);
-              await sendIMessage(ISAIAH, `PR open: ${prUrl}`);
+              await sendGuardedIMessage(ISAIAH, `PR open: ${prUrl}`);
             } else {
               // Push declined — reopen bead
               await execAsync(`${process.env.HOME}/.local/bin/bd update ${beadId} --status open`).catch(() => {});
               await notionLogger.logTimelineEvent(pageId, 'failed', 'Push declined by Isaiah');
-              await sendIMessage(ISAIAH, `Push declined. Bead ${beadId} reopened. What should I change?`);
+              await sendGuardedIMessage(ISAIAH, `Push declined. Bead ${beadId} reopened. What should I change?`);
             }
           } else {
             // No commits or phase failed — reopen bead
             await execAsync(`${process.env.HOME}/.local/bin/bd reopen ${beadId} --reason "No commits produced in session ${sessionId}"`).catch(() => {});
             executionLogger.log({ event: 'bead_failed', beadId, project: project.id, sessionId, reason: hasCommits ? 'phase failed' : 'no commits' });
             await notionLogger.logTimelineEvent(pageId, 'failed', `Task failed — ${hasCommits ? 'phase error' : 'no commits produced'}`);
-            await sendIMessage(ISAIAH,
+            await sendGuardedIMessage(ISAIAH,
               `${project.name} — ${beadTitle} failed (${hasCommits ? 'phase error' : 'zero commits'}).\n` +
               `Bead ${beadId} reopened. Check Notion: ${notionLogger.pageUrl(pageId)}`
             );
@@ -1517,7 +1565,7 @@ async function executeTool(
         } catch (err) {
           executionLogger.log({ event: 'bead_failed', beadId, project: project.id, sessionId, error: String(err) });
           await notionLogger.logTimelineEvent(pageId, 'failed', `Task error: ${String(err).slice(0, 100)}`);
-          await sendIMessage(ISAIAH,
+          await sendGuardedIMessage(ISAIAH,
             `${project.name} — ${beadTitle} stuck.\nError: ${String(err).slice(0, 200)}\nCheck Notion: ${notionLogger.pageUrl(pageId)}`
           );
         } finally {
@@ -1705,7 +1753,7 @@ async function executeTool(
             conflicting.status = 'queued';
             await saveBatchState(conflicting);
             runBatchAsync(conflicting, resumeProject, conflicting.sessionId).catch(err => {
-              sendIMessage(ISAIAH, `Auto-resume failed for ${conflicting.batchId}: ${String(err).slice(0, 200)}`);
+              sendGuardedIMessage(ISAIAH, `Auto-resume failed for ${conflicting.batchId}: ${String(err).slice(0, 200)}`);
             });
             return JSON.stringify({
               message: `Found paused batch with all ${conflicting.results.length} beads completed. Auto-resuming for build check + review + PR.\n` +
@@ -1765,7 +1813,7 @@ async function executeTool(
       );
       if (!pageId) {
         console.error(`[ios_start_batch] Notion page creation failed for batch ${batchId}`);
-        await sendIMessage(ISAIAH,
+        await sendGuardedIMessage(ISAIAH,
           `Warning: Notion page creation failed for batch ${batchId}. Batch will proceed but Notion logging will be unavailable.`
         );
       }
@@ -1796,7 +1844,7 @@ async function executeTool(
         state.status = 'failed';
         await saveBatchState(state);
         executionLogger.log({ event: 'batch_failed', project: project.id, sessionId, error: String(err) });
-        await sendIMessage(ISAIAH,
+        await sendGuardedIMessage(ISAIAH,
           `Batch ${batchId} crashed: ${String(err).slice(0, 200)}\nNotion: ${notionLogger.pageUrl(pageId)}`
         );
       });
@@ -1892,7 +1940,7 @@ async function executeTool(
         runBatchAsync(batchState, project, sessionId).catch(async (err) => {
           batchState.status = 'failed';
           await saveBatchState(batchState);
-          await sendIMessage(ISAIAH,
+          await sendGuardedIMessage(ISAIAH,
             `Batch ${batchState.batchId} crashed on resume: ${String(err).slice(0, 200)}\nNotion: ${notionLogger.pageUrl(batchState.notionPageId)}`
           );
         });
@@ -1922,7 +1970,7 @@ async function executeTool(
         batchState.status = 'failed';
         await saveBatchState(batchState);
         executionLogger.log({ event: 'batch_failed', project: project.id, sessionId, error: String(err) });
-        await sendIMessage(ISAIAH,
+        await sendGuardedIMessage(ISAIAH,
           `Batch ${batchState.batchId} crashed on resume: ${String(err).slice(0, 200)}\nNotion: ${notionLogger.pageUrl(batchState.notionPageId)}`
         );
       });
@@ -2024,9 +2072,16 @@ export async function handleMessage(
   const systemPrompt = await buildSystemPrompt(callerIdentity, dateContext);
 
   // Build API messages from conversation history
+  // Prefix each prior plain-text message with its timestamp so the model knows
+  // HOW OLD it is. Without this, stale history replayed under today's date
+  // context caused mis-dated scheduling (e.g. "next month" → a future year).
+  // Only string content is annotated; structured tool_use/tool_result blocks
+  // are passed through untouched.
   const apiMessages: Array<{ role: string; content: unknown }> = conversationHistory.map(msg => ({
     role: msg.role,
-    content: msg.content,
+    content: typeof msg.content === 'string' && msg.timestamp
+      ? `[${msg.timestamp}] ${msg.content}`
+      : msg.content,
   }));
 
   // Add the new user message

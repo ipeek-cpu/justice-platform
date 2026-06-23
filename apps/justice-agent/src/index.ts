@@ -112,6 +112,12 @@ console.log('[nudge] Task nudger active, checking every 30 minutes');
 setInterval(runMorningBrief, 10 * 60 * 1000);
 console.log('[morning-brief] Active, will deliver between 8:00-8:15 AM CT');
 
+// Surface the autonomous-batch + outbound posture at startup so a misconfigured
+// env (e.g. the batch pipeline accidentally left on) is obvious in the logs.
+console.log(`[startup] Autonomous batch pipeline: ${isAutonomousBatchEnabled() ? 'ENABLED' : 'disabled (default)'}`);
+console.log(`[startup] Outbound iMessage cap: ${process.env.JUSTICE_OUTBOUND_DAILY_MAX ?? '20'}/day` +
+  `${process.env.JUSTICE_OUTBOUND_PAUSE === 'true' ? ' — PAUSED (kill-switch on)' : ''}`);
+
 // Proactive cron jobs (daily checks at 8am)
 startCronJobs();
 

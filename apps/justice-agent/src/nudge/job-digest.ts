@@ -9,7 +9,7 @@
 
 import { queryNotionDatabase } from '../integrations/notion-client';
 import { notionLogger } from '../integrations/notion-logger';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from './send-guard';
 
 let lastDigestDate: string | null = null;
 
@@ -89,11 +89,11 @@ export async function runJobDigest(force = false): Promise<void> {
 
   const message = `Job digest — top ${rows.length} new match${rows.length === 1 ? '' : 'es'}:\n\n${lines.join('\n\n')}`;
 
-  const send = await sendIMessage(phone, message);
-  if (send.success) {
+  const send = await sendGuardedIMessage(phone, message, 'job_digest');
+  if (send.sent) {
     lastDigestDate = today;
     console.log(`[job-digest] Sent for ${today} (${rows.length} matches)`);
   } else {
-    console.error('[job-digest] iMessage send failed:', send.error);
+    console.error('[job-digest] iMessage not sent:', send.reason);
   }
 }

@@ -7,7 +7,7 @@
 
 import { spawn, exec } from 'child_process';
 import { promisify } from 'util';
-import { sendIMessage } from '@justice/messaging';
+import { sendGuardedIMessage } from '../nudge/send-guard';
 import { atomicClaim, renewClaim, cleanupTask } from '@justice/shared-types';
 import { notionLogger, type WorkPhase } from '../integrations/notion-logger';
 import { createApproval, getApproval, formatStamp } from '../integrations/approval-gate';
@@ -63,7 +63,7 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
     if (!claimed) {
       const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
       if (approvedNumber) {
-        await sendIMessage(approvedNumber,
+        await sendGuardedIMessage(approvedNumber,
           `Task ${session.beadId} is already running in another session. Skipping.`
         );
       }
@@ -136,7 +136,7 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
       if (!opts?.silent && elapsed > 0 && elapsed % 30 === 0) {
         const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
         if (approvedNumber) {
-          await sendIMessage(approvedNumber,
+          await sendGuardedIMessage(approvedNumber,
             `${session.taskName} still working (${elapsed}min). Not stuck.`
           ).catch(() => {});
         }
@@ -184,7 +184,7 @@ export async function runPhase(session: TaskSession, phase: WorkPhase, opts?: Ru
         const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
         if (approvedNumber) {
           const stamp = await createApproval(session.sessionId, `Phase ${phase.number} ${statusEmoji}: ${phase.name}`);
-          await sendIMessage(
+          await sendGuardedIMessage(
             approvedNumber,
             `Phase ${phase.number} ${statusEmoji}: ${phase.name} (${duration}) ${formatStamp(stamp)}\nNotion: ${notionLogger.pageUrl(session.notionPageId)}\nReply "yes ${stamp}" to continue or "no ${stamp}" to stop.`
           );
@@ -222,7 +222,7 @@ export async function waitForApproval(
 
   const approvedNumber = process.env.APPROVED_NUMBER_ISAIAH;
   if (approvedNumber) {
-    await sendIMessage(approvedNumber, `Justice needs approval: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`);
+    await sendGuardedIMessage(approvedNumber, `Justice needs approval: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`);
   }
 
   return new Promise((resolve) => {
@@ -247,7 +247,7 @@ export async function waitForApproval(
           resolve(false);
         } else if (Date.now() - lastPing > REPING_MS) {
           if (approvedNumber) {
-            await sendIMessage(approvedNumber,
+            await sendGuardedIMessage(approvedNumber,
               `Reminder: ${question} ${formatStamp(stamp)}\nReply "yes ${stamp}" or "no ${stamp}".`
             );
           }

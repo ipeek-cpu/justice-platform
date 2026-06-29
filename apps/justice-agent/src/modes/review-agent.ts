@@ -1,7 +1,6 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { notionLogger } from '../integrations/notion-logger';
-import { sendIMessage } from '@justice/messaging';
 import { runPhase } from './code-executor';
 import { shellExec } from '../integrations/shell-exec';
 

@@ -18,7 +18,17 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 
 // --- Config ---
-const ROWID_FILE = '/tmp/justice_last_rowid';
+const MEMORY_DIR = `${process.env.HOME}/Developer/justice-repo/memory`;
+// Watermark lives in the repo (NOT /tmp). /tmp is wiped on reboot, which made a
+// cold start fall back to rowid 0 and replay the ENTIRE inbound backlog,
+// re-replying to every stored message — the worst flood vector. See plan.
+const ROWID_FILE = `${MEMORY_DIR}/.justice_last_rowid`;
+// Kill-switch sentinel — shared with the agent's send-guard (PAUSE_SENTINEL).
+const PAUSE_SENTINEL = `${MEMORY_DIR}/OUTBOUND_PAUSE`;
+// Reply throttle state (per-day count + dedup) — defense in depth, since each
+// listener invocation is a fresh 5s process with no in-memory continuity.
+const STATE_FILE = `${MEMORY_DIR}/.justice_listener_state.json`;
+const REPLY_DAILY_MAX = 30;
 const LOG_FILE = '/tmp/justice-imessage.log';
 const ERROR_LOG = '/tmp/justice-imessage-error.log';
 const WEBHOOK_URL = 'http://localhost:3002/webhook/executive';
@@ -117,6 +127,78 @@ function getDopplerSecret(name) {
   }
 }
 
+/**
+ * Kill-switch. Muted if the local sentinel file exists OR Doppler says pause.
+ * The listener has no Doppler env injected, so it reads the secret on demand.
+ */
+function isPaused() {
+  if (fs.existsSync(PAUSE_SENTINEL)) return true;
+  return (process.env.JUSTICE_OUTBOUND_PAUSE || getDopplerSecret('JUSTICE_OUTBOUND_PAUSE')) === 'true';
+}
+
+/**
+ * Resolve the last-processed rowid. Reads the persisted watermark; on a cold
+ * start (missing/invalid file) it SEEDS to the current MAX(rowid) so history is
+ * never replayed. Returns null only if even the seed query fails — callers must
+ * then SKIP the cycle rather than fall back to 0.
+ */
+function getLastRowid() {
+  try {
+    const v = parseInt(fs.readFileSync(ROWID_FILE, 'utf8').trim(), 10);
+    if (Number.isFinite(v) && v > 0) return v;
+  } catch {}
+  try {
+    const out = execSync(`${SQLITE3} "${CHAT_DB}" "SELECT IFNULL(MAX(rowid),0) FROM message"`, {
+      encoding: 'utf8', timeout: 8000,
+    }).trim();
+    const maxId = parseInt(out, 10);
+    if (Number.isFinite(maxId)) {
+      writeRowid(maxId);
+      log(`Cold start — seeded watermark to MAX(rowid)=${maxId} (no backlog replay)`);
+      return maxId;
+    }
+  } catch (err) {
+    logError(`MAX(rowid) seed failed: ${err.message}`);
+  }
+  return null;
+}
+
+function writeRowid(rowid) {
+  try { fs.mkdirSync(MEMORY_DIR, { recursive: true }); } catch {}
+  fs.writeFileSync(ROWID_FILE, String(rowid));
+}
+
+function todayCT() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
+}
+
+function readReplyState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (s && s.day === todayCT()) return { day: s.day, replyCount: s.replyCount || 0, hashes: s.hashes || [] };
+  } catch {}
+  return { day: todayCT(), replyCount: 0, hashes: [] };
+}
+
+function writeReplyState(state) {
+  try {
+    fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+  } catch (err) {
+    // Don't throw — a state-write failure must not abort the loop before the
+    // watermark advances (which would reprocess and risk a duplicate reply).
+    logError(`reply-state write failed: ${err.message}`);
+  }
+}
+
+/** Simple stable hash (djb2) of sender+reply for same-day dedup. */
+function replyHash(sender, reply) {
+  let h = 5381;
+  const s = `${sender} ${reply}`;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return String(h >>> 0);
+}
+
 function readStdin() {
   return new Promise((resolve) => {
     let data = '';
@@ -136,8 +218,11 @@ function readStdin() {
  * (which can't be granted FDA) is involved.
  */
 function readNewMessagesFromDb() {
-  let lastRowid = 0;
-  try { lastRowid = parseInt(fs.readFileSync(ROWID_FILE, 'utf8').trim(), 10) || 0; } catch {}
+  const lastRowid = getLastRowid();
+  if (lastRowid === null) {
+    logError('Could not resolve watermark — skipping cycle (refusing to default to 0)');
+    return [];
+  }
   const sql = `SELECT m.rowid AS ROWID, m.text, hex(m.attributedBody) AS attributedBodyHex, h.id AS sender `
     + `FROM message m JOIN handle h ON m.handle_id = h.rowid `
     + `WHERE m.rowid > ${lastRowid} AND m.is_from_me = 0 `
@@ -183,11 +268,24 @@ async function main() {
     return;
   }
 
+  // Kill-switch: when paused, still drain the queue (advance the watermark so
+  // paused messages aren't reprocessed later) but send NOTHING and skip the
+  // webhook (which can itself trigger guarded sends).
+  const paused = isPaused();
+  if (paused) log('OUTBOUND PAUSED — advancing watermark without replying');
+
+  const replyState = readReplyState();
+
   for (const row of rows) {
     const sender = normalizePhone(row.sender);
 
     if (!approved.includes(sender)) {
-      fs.writeFileSync(ROWID_FILE, String(row.ROWID));
+      writeRowid(row.ROWID);
+      continue;
+    }
+
+    if (paused) {
+      writeRowid(row.ROWID);
       continue;
     }
 
@@ -198,7 +296,7 @@ async function main() {
 
     if (!messageText) {
       log(`Skipping rowid ${row.ROWID} — no extractable text`);
-      fs.writeFileSync(ROWID_FILE, String(row.ROWID));
+      writeRowid(row.ROWID);
       continue;
     }
 
@@ -225,27 +323,38 @@ async function main() {
       logError(`Webhook failed for ${sender}: ${err.message}`);
     }
 
-    // Send reply via AppleScript
+    // Send reply via AppleScript — throttled and deduped (defense in depth;
+    // these replies bypass the agent's send-guard, so they get their own caps).
     if (reply) {
-      const sanitized = sanitizeForAppleScript(reply);
-      const originalSender = row.sender; // use original handle ID for AppleScript
-      const script = `
-        tell application "Messages"
-          set targetService to 1st service whose service type = iMessage
-          set targetBuddy to buddy "${originalSender}" of targetService
-          send "${sanitized}" to targetBuddy
-        end tell
-      `.replace(/'/g, "'\\''");
+      const hash = replyHash(sender, reply);
+      if (replyState.replyCount >= REPLY_DAILY_MAX) {
+        logError(`Reply cap ${REPLY_DAILY_MAX}/day reached — suppressing reply to ${sender}`);
+      } else if (replyState.hashes.includes(hash)) {
+        log(`Duplicate reply suppressed for ${sender} (same body already sent today)`);
+      } else {
+        const sanitized = sanitizeForAppleScript(reply);
+        const originalSender = row.sender; // use original handle ID for AppleScript
+        const script = `
+          tell application "Messages"
+            set targetService to 1st service whose service type = iMessage
+            set targetBuddy to buddy "${originalSender}" of targetService
+            send "${sanitized}" to targetBuddy
+          end tell
+        `.replace(/'/g, "'\\''");
 
-      try {
-        execSync(`osascript -e '${script}'`, { timeout: 10000 });
-        log(`Reply sent to ${sender}: ${reply.slice(0, 50)}${reply.length > 50 ? '...' : ''}`);
-      } catch (err) {
-        logError(`osascript failed for sender=${sender}: ${err.message}`);
+        try {
+          execSync(`osascript -e '${script}'`, { timeout: 10000 });
+          replyState.replyCount++;
+          replyState.hashes.push(hash);
+          writeReplyState(replyState);
+          log(`Reply sent to ${sender}: ${reply.slice(0, 50)}${reply.length > 50 ? '...' : ''}`);
+        } catch (err) {
+          logError(`osascript failed for sender=${sender}: ${err.message}`);
+        }
       }
     }
 
-    fs.writeFileSync(ROWID_FILE, String(row.ROWID));
+    writeRowid(row.ROWID);
   }
 }
 

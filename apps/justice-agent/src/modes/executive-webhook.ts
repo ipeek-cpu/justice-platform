@@ -29,6 +29,7 @@ import { getCallerIdentity } from '../access-control/approved-numbers';
 import { parseApprovalReply, formatStamp } from '../integrations/approval-gate';
 import { demoStream } from '../integrations/demo-stream';
 import { processPostCallForDemo } from './demo-call-processor';
+import { isOutboundPaused } from '../nudge/send-guard';
 
 const PORT = parseInt(process.env.EXECUTIVE_WEBHOOK_PORT ?? '3002', 10);
 
@@ -127,6 +128,13 @@ function isJsonRequest(req: IncomingMessage): boolean {
 // --- Twilio outbound SMS ---
 
 async function sendTwilioReply(to: string, body: string): Promise<void> {
+  // Honor the kill-switch on the SMS reply channel too (the .env.example advertises
+  // JUSTICE_OUTBOUND_PAUSE as muting ALL automated messages). Reactive 1:1 replies,
+  // so no global-cap counting — just respect the pause.
+  if (isOutboundPaused()) {
+    console.warn('[executive-webhook] OUTBOUND PAUSED — suppressing Twilio SMS reply');
+    return;
+  }
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
   const from = process.env.TWILIO_FROM_NUMBER;

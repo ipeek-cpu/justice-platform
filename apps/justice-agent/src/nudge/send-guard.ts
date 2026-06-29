@@ -18,11 +18,22 @@
  * storm is not.
  */
 
+import { createHash } from 'crypto';
+import { existsSync } from 'fs';
 import { getRedis } from '../integrations/redis-client';
 import { sendIMessage } from '@justice/messaging';
 
 const DEFAULT_DAILY_MAX = 20;
+const DEFAULT_TOPIC_MAX = 1;
 const TZ = 'America/Chicago';
+
+/**
+ * Local sentinel file kill-switch. `touch`-ing this file instantly mutes ALL
+ * automated sends without waiting on Doppler propagation, and the inbound
+ * iMessage listener (which has no Doppler env) honors the same file. Path is
+ * absolute so it resolves identically from the agent and the listener.
+ */
+export const PAUSE_SENTINEL = `${process.env.HOME}/Developer/justice-repo/memory/OUTBOUND_PAUSE`;
 
 /** YYYY-MM-DD in Central time (en-CA renders ISO-style). */
 function todayCT(): string {
@@ -46,9 +57,20 @@ function dailyMax(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_DAILY_MAX;
 }
 
-/** Instant silence valve — set JUSTICE_OUTBOUND_PAUSE=true to mute all automated sends. */
+/** Per-topic daily cap — at most this many messages about a single topic per CT day. */
+function topicMaxDefault(): number {
+  const raw = parseInt(process.env.JUSTICE_OUTBOUND_TOPIC_MAX ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TOPIC_MAX;
+}
+
+/**
+ * Instant silence valve. Muted if the Doppler env flag is set OR the local
+ * sentinel file exists. Doppler covers reboot-durability for the agent; the
+ * sentinel file is instant and is also the only channel the inbound listener
+ * can read (it has no Doppler env injected).
+ */
 export function isOutboundPaused(): boolean {
-  return process.env.JUSTICE_OUTBOUND_PAUSE === 'true';
+  return process.env.JUSTICE_OUTBOUND_PAUSE === 'true' || existsSync(PAUSE_SENTINEL);
 }
 
 /**
@@ -94,7 +116,21 @@ export async function addToDailySet(set: string, members: string[]): Promise<voi
 
 export interface GuardedSendResult {
   sent: boolean;
-  reason?: 'paused' | 'cap-exceeded' | 'redis-unavailable' | string;
+  reason?: 'paused' | 'cap-exceeded' | 'topic-cap' | 'duplicate' | 'redis-unavailable' | string;
+}
+
+export interface GuardOpts {
+  /** Stable per-item key (e.g. a bead id) so repeats about ONE thing are capped. */
+  topic?: string;
+  /** Override the per-topic daily cap for this send. */
+  topicMax?: number;
+}
+
+const DEFAULT_KIND = 'agent_notification';
+
+/** sha256 of recipient+body (so the same text to two people is not blocked). */
+function bodyHash(phone: string, message: string): string {
+  return createHash('sha256').update(`${phone} ${message}`).digest('hex').slice(0, 16);
 }
 
 /**
@@ -105,11 +141,43 @@ export interface GuardedSendResult {
 export async function sendGuardedIMessage(
   phone: string,
   message: string,
-  kind = 'agent_notification',
+  kind = DEFAULT_KIND,
+  opts: GuardOpts = {},
 ): Promise<GuardedSendResult> {
   if (isOutboundPaused()) {
     console.warn(`[send-guard] OUTBOUND PAUSED — suppressing ${kind}`);
     return { sent: false, reason: 'paused' };
+  }
+
+  // Content dedup: never send the same body to the same recipient twice in a
+  // day. Fail-closed (Redis down => suppress), matching the module philosophy.
+  const hash = bodyHash(phone, message);
+  try {
+    if (await isInDailySet('msghash', hash)) {
+      console.warn(`[send-guard] Duplicate ${kind} suppressed (same body already sent today)`);
+      return { sent: false, reason: 'duplicate' };
+    }
+  } catch (err) {
+    console.error(`[send-guard] Redis unavailable on dedup check — suppressing ${kind}:`, err);
+    return { sent: false, reason: 'redis-unavailable' };
+  }
+
+  // Per-topic cap: a meaningful `kind` is its own channel; an explicit topic
+  // (e.g. a bead id) overrides. Generic agent_notification sends have no topic
+  // and rely on the global cap + content dedup so batch-progress streams aren't
+  // throttled to 1/day.
+  const effectiveTopic = opts.topic ?? (kind !== DEFAULT_KIND ? kind : null);
+  if (effectiveTopic) {
+    const tmax = opts.topicMax ?? topicMaxDefault();
+    try {
+      if (await dailyCount(`topic:${effectiveTopic}`) >= tmax) {
+        console.warn(`[send-guard] Topic cap ${tmax} reached for "${effectiveTopic}" — suppressing ${kind}`);
+        return { sent: false, reason: 'topic-cap' };
+      }
+    } catch (err) {
+      console.error(`[send-guard] Redis unavailable on topic check — suppressing ${kind}:`, err);
+      return { sent: false, reason: 'redis-unavailable' };
+    }
   }
 
   const max = dailyMax();
@@ -139,5 +207,13 @@ export async function sendGuardedIMessage(
     console.error(`[send-guard] ${kind} send failed:`, result.error);
     return { sent: false, reason: result.error };
   }
+
+  // Record post-send guards (best-effort; a failure here must not double-send,
+  // but log it — a silent miss means the next identical/same-topic send won't be
+  // deduped/capped until Redis recovers).
+  await addToDailySet('msghash', [hash]).catch(err =>
+    console.error(`[send-guard] post-send dedup record failed for ${kind}:`, err));
+  if (effectiveTopic) await incrDaily(`topic:${effectiveTopic}`).catch(err =>
+    console.error(`[send-guard] post-send topic incr failed for ${effectiveTopic}:`, err));
   return { sent: true };
 }

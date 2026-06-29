@@ -155,6 +155,15 @@ export async function runMorningBrief(force = false): Promise<void> {
   const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
   const endOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7);
 
+  // Data hygiene: drop ancient deadline-less tasks so the brief stops surfacing
+  // orphaned records Isaiah no longer recognizes (the "flagged work session"
+  // class of noise). Tasks WITH a deadline are always kept.
+  const STALE_NO_DEADLINE_DAYS = 30;
+  const staleBefore = new Date(now.getTime() - STALE_NO_DEADLINE_DAYS * 24 * 60 * 60 * 1000);
+  pendingTasks = pendingTasks.filter(
+    t => t.deadline != null || (t.createdAt != null && new Date(t.createdAt) >= staleBefore)
+  );
+
   const overdue: { title: string; daysOverdue: number; priority: string }[] = [];
   const dueToday: { title: string; priority: string }[] = [];
   const dueThisWeek: { title: string; deadline: string; priority: string }[] = [];

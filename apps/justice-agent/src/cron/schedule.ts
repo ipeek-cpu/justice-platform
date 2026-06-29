@@ -65,7 +65,6 @@ export function startCronJobs(): void {
         `  \u2022 Any job apps or outreach to prioritize?`,
         ``,
         `Health`,
-        `  \u2022 Gym schedule set for the week?`,
         `  \u2022 Meal prep needed?`,
         ``,
         `Reflection`,

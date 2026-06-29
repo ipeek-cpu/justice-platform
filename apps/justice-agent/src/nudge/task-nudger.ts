@@ -165,7 +165,9 @@ export async function runTaskNudge(): Promise<void> {
 
   const message = lines.join('\n');
 
-  const result = await sendGuardedIMessage(phoneNumber, message, 'task_nudge');
+  // topicMax: 2 preserves this sender's existing 2/day allowance (its own
+  // dailyCount('nudge') >= 2 guard remains the primary cap; this is a backstop).
+  const result = await sendGuardedIMessage(phoneNumber, message, 'task_nudge', { topicMax: 2 });
   if (result.sent) {
     lastNudgeAt = new Date().toISOString();
     // Persist authoritative guards, then update display mirrors.

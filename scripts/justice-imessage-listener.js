@@ -181,8 +181,14 @@ function readReplyState() {
 }
 
 function writeReplyState(state) {
-  try { fs.mkdirSync(MEMORY_DIR, { recursive: true }); } catch {}
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+  try {
+    fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+  } catch (err) {
+    // Don't throw — a state-write failure must not abort the loop before the
+    // watermark advances (which would reprocess and risk a duplicate reply).
+    logError(`reply-state write failed: ${err.message}`);
+  }
 }
 
 /** Simple stable hash (djb2) of sender+reply for same-day dedup. */

@@ -4,23 +4,25 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 class FakeRedis {
   store = new Map<string, string>();
   sets = new Map<string, Set<string>>();
-  failNext = false; // when true, the next op throws (simulates Redis down)
+  failNext = false;          // when true, the next op throws (simulates Redis down)
+  failOn = new Set<string>(); // op names that should throw (e.g. 'get', 'incr', 'sismember')
 
-  private guard() {
+  private guard(op: string) {
     if (this.failNext) { this.failNext = false; throw new Error('redis down'); }
+    if (this.failOn.has(op)) throw new Error(`redis down on ${op}`);
   }
-  async get(k: string) { this.guard(); return this.store.get(k) ?? null; }
-  async set(k: string, v: string) { this.guard(); this.store.set(k, v); return 'OK'; }
+  async get(k: string) { this.guard('get'); return this.store.get(k) ?? null; }
+  async set(k: string, v: string) { this.guard('set'); this.store.set(k, v); return 'OK'; }
   async incr(k: string) {
-    this.guard();
+    this.guard('incr');
     const n = (parseInt(this.store.get(k) ?? '0', 10) || 0) + 1;
     this.store.set(k, String(n));
     return n;
   }
-  async expire() { this.guard(); return 1; }
-  async sismember(k: string, m: string) { this.guard(); return this.sets.get(k)?.has(m) ? 1 : 0; }
+  async expire() { this.guard('expire'); return 1; }
+  async sismember(k: string, m: string) { this.guard('sismember'); return this.sets.get(k)?.has(m) ? 1 : 0; }
   async sadd(k: string, ...m: string[]) {
-    this.guard();
+    this.guard('sadd');
     const s = this.sets.get(k) ?? new Set<string>();
     m.forEach(x => s.add(x));
     this.sets.set(k, s);
@@ -39,6 +41,8 @@ vi.mock('fs', () => ({ existsSync: () => sentinelExists }));
 import { sendGuardedIMessage } from './send-guard';
 
 const PHONE = '+15555550123';
+// mirrors send-guard's internal CT day key
+const todayCT = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
 
 beforeEach(() => {
   fake = new FakeRedis();
@@ -113,6 +117,32 @@ describe('sendGuardedIMessage', () => {
     expect(sendMock).not.toHaveBeenCalled();
   });
 
+  it('fails closed when Redis is unavailable on the TOPIC check', async () => {
+    // dedup (sismember) succeeds, but the topic dailyCount (get) throws
+    fake.failOn = new Set(['get']);
+    const r = await sendGuardedIMessage(PHONE, 'x', 'morning_brief');
+    expect(r).toEqual({ sent: false, reason: 'redis-unavailable' });
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when Redis is unavailable on the GLOBAL incr', async () => {
+    // dedup + topic checks pass, but the global incr (incr) throws
+    fake.failOn = new Set(['incr']);
+    const r = await sendGuardedIMessage(PHONE, 'x', 'morning_brief');
+    expect(r).toEqual({ sent: false, reason: 'redis-unavailable' });
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('does NOT bump the topic counter when the underlying send fails', async () => {
+    sendMock.mockImplementationOnce(async () => ({ success: false, error: 'imessage failed' }));
+    const first = await sendGuardedIMessage(PHONE, 'attempt 1', 'morning_brief');
+    expect(first.sent).toBe(false);
+    // topic budget must NOT have been consumed by the failed send — a retry sends
+    const second = await sendGuardedIMessage(PHONE, 'attempt 2', 'morning_brief');
+    expect(second.sent).toBe(true);
+    expect(await fake.get(`justice:count:topic:morning_brief:${todayCT()}`)).toBe('1');
+  });
+
   it('enforces the global daily cap regardless of distinct topics', async () => {
     process.env.JUSTICE_OUTBOUND_DAILY_MAX = '3';
     const results = [];
@@ -124,5 +154,18 @@ describe('sendGuardedIMessage', () => {
     expect(sentCount).toBe(3);
     // the 4th crosses the cap and emits exactly one terminal notice
     expect(results[4].reason).toBe('cap-exceeded');
+  });
+
+  it('emits the terminal cap notice exactly once', async () => {
+    process.env.JUSTICE_OUTBOUND_DAILY_MAX = '1';
+    for (let i = 0; i < 5; i++) {
+      await sendGuardedIMessage(PHONE, `msg ${i}`, `kind${i}`, { topic: `t${i}` });
+    }
+    const capNotices = sendMock.mock.calls.filter(
+      c => typeof c[1] === 'string' && c[1].includes('daily message cap')
+    );
+    expect(capNotices).toHaveLength(1);
+    // 1 real send (the only one under the cap of 1) + 1 terminal notice = 2 total
+    expect(sendMock).toHaveBeenCalledTimes(2);
   });
 });

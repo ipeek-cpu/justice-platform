@@ -4,7 +4,6 @@ import * as yaml from 'js-yaml';
 import Anthropic from '@anthropic-ai/sdk';
 import { getClient } from '../integrations/notion-client';
 import { notionLogger } from '../integrations/notion-logger';
-import { sendIMessage } from '@justice/messaging';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const ISAIAH = process.env.APPROVED_NUMBER_ISAIAH!;

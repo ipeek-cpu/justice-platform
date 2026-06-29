@@ -1395,7 +1395,7 @@ async function executeTool(
         const { scored } = await runJobDiscovery();
         await runApplyAssist(scored, ctx, opts);
       })().catch(err => {
-        if (ISAIAH) sendGuardedIMessage(ISAIAH, `Apply-assist failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+        if (ISAIAH) sendGuardedIMessage(ISAIAH, `Apply-assist failed: ${err instanceof Error ? err.message : 'unknown error'}`, 'agent_notification', { topic: 'apply-assist-fail' });
       });
       return JSON.stringify({ message: 'Apply-assist started — sourcing + scoring now. I\'ll text you the shortlist and an approval request before drafting any outreach. Nothing is ever submitted or sent automatically.' });
     }
@@ -1406,7 +1406,7 @@ async function executeTool(
       if (!project) return JSON.stringify({ error: `Unknown project: ${input.project_id}` });
       // Fire and forget — runs async, reports via iMessage at completion
       runOvernightSession(input.project_id as string).catch(err =>
-        sendGuardedIMessage(ISAIAH, `Overnight run failed for ${project.name}: ${err.message}`)
+        sendGuardedIMessage(ISAIAH, `Overnight run failed for ${project.name}: ${err.message}`, 'agent_notification', { topic: `overnight-fail:${project.name}` })
       );
       return JSON.stringify({ message: `${project.name} overnight run started. You'll get an iMessage when complete.` });
     }
@@ -1753,7 +1753,7 @@ async function executeTool(
             conflicting.status = 'queued';
             await saveBatchState(conflicting);
             runBatchAsync(conflicting, resumeProject, conflicting.sessionId).catch(err => {
-              sendGuardedIMessage(ISAIAH, `Auto-resume failed for ${conflicting.batchId}: ${String(err).slice(0, 200)}`);
+              sendGuardedIMessage(ISAIAH, `Auto-resume failed for ${conflicting.batchId}: ${String(err).slice(0, 200)}`, 'agent_notification', { topic: `auto-resume-fail:${conflicting.batchId}` });
             });
             return JSON.stringify({
               message: `Found paused batch with all ${conflicting.results.length} beads completed. Auto-resuming for build check + review + PR.\n` +

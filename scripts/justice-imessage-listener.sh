@@ -5,8 +5,16 @@
 
 cd /Users/justicewolf/Developer/justice-repo
 
-LAST_ROWID=$(cat /tmp/justice_last_rowid 2>/dev/null || echo "0")
 DB="file:$HOME/Library/Messages/chat.db?mode=ro"
+# Watermark lives in the repo (NOT /tmp, which is wiped on reboot). On a cold
+# start with no watermark, seed to the CURRENT MAX(rowid) so we never replay the
+# inbound backlog. Mirrors getLastRowid() in justice-imessage-listener.js.
+ROWID_FILE="$HOME/Developer/justice-repo/memory/.justice_last_rowid"
+LAST_ROWID=$(cat "$ROWID_FILE" 2>/dev/null)
+if ! [[ "$LAST_ROWID" =~ ^[0-9]+$ ]] || [ "$LAST_ROWID" -le 0 ]; then
+  LAST_ROWID=$(sqlite3 "$DB" "SELECT IFNULL(MAX(rowid),0) FROM message" 2>/dev/null || echo "0")
+  echo "$LAST_ROWID" > "$ROWID_FILE"
+fi
 
 sqlite3 -json "$DB" "
   SELECT m.rowid AS ROWID,

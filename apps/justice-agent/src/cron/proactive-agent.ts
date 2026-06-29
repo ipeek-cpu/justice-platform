@@ -1,12 +1,9 @@
 import { sendGuardedIMessage } from '../nudge/send-guard';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { executionLogger } from '../integrations/execution-logger';
 import { isAutonomousBatchEnabled } from '../config/feature-flags';
 
-const execAsync = promisify(exec);
 const ISAIAH = process.env.APPROVED_NUMBER_ISAIAH!;
 
 // Run all proactive checks. Called by cron at 8am daily.
@@ -19,35 +16,12 @@ export async function runProactiveChecks(): Promise<void> {
     alerts.push(`Case metrics haven't run since ${lastMetrics}. Run now?`);
   }
 
-  // Check 2: Aging blocked beads (blocked > 48 hours)
-  const { stdout: blockedOutput } = await execAsync(
-    `${process.env.HOME}/.local/bin/bd list --status blocked --json`
-  ).catch(() => ({ stdout: '[]' }));
-  const blocked = JSON.parse(blockedOutput || '[]');
-  const agingBlocked = blocked.filter((b: any) =>
-    b.updated_at && daysSince(b.updated_at) >= 2
-  );
-  if (agingBlocked.length > 0) {
-    alerts.push(
-      `${agingBlocked.length} bead(s) blocked 2+ days: ` +
-      agingBlocked.map((b: any) => b.id).join(', ')
-    );
-  }
-
-  // Check 3: iOS project idle (in_progress > 72 hours with no commits)
-  const { stdout: inProgressOutput } = await execAsync(
-    `${process.env.HOME}/.local/bin/bd list --status in_progress --label ios --json`
-  ).catch(() => ({ stdout: '[]' }));
-  const inProgress = JSON.parse(inProgressOutput || '[]');
-  const idle = inProgress.filter((b: any) =>
-    b.updated_at && daysSince(b.updated_at) >= 3
-  );
-  if (idle.length > 0) {
-    alerts.push(
-      `iOS task(s) idle 3+ days with no activity: ` +
-      idle.map((b: any) => `${b.id} (${b.title})`).join(', ')
-    );
-  }
+  // Checks 2 & 3 (aging blocked beads / iOS-idle beads) REMOVED 2026-06-29.
+  // They re-queried `bd list` every morning with no "already notified" memory,
+  // so a single stuck bead produced an identical ping every day — the exact
+  // "stale records resurfacing" / batch-blocker spam Isaiah was hit with.
+  // Beads/blocker notifications are intentionally off; re-adding them is a
+  // deliberate future change, not a default. See plan: durable anti-flood fix.
 
   // Check 4: LinkedIn recruiter pipeline (no outreach in 14 days)
   const lastOutreach = await getLastLinkedInOutreachDate();
@@ -80,7 +54,7 @@ export async function runProactiveChecks(): Promise<void> {
   if (alerts.length > 0) {
     const msg = `Good morning. ${alerts.length} item(s) need attention:\n` +
       alerts.map((a, i) => `${i + 1}. ${a}`).join('\n');
-    await sendGuardedIMessage(ISAIAH, msg, 'proactive_alert');
+    await sendGuardedIMessage(ISAIAH, msg, 'proactive_alert', { topic: 'proactive_alert' });
   }
 }
 

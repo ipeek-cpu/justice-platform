@@ -29,7 +29,7 @@ class FakeRedis {
 }
 
 let fake: FakeRedis;
-const sendMock = vi.fn(async () => ({ success: true }));
+const sendMock = vi.fn(async (..._args: unknown[]) => ({ success: true }));
 let sentinelExists = false;
 
 vi.mock('../integrations/redis-client', () => ({ getRedis: () => fake }));
